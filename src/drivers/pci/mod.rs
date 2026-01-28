@@ -167,6 +167,23 @@ impl PciDevice {
         }
         None
     }
+
+    /// Get the I/O base address for the device
+    ///
+    /// This is used by controllers like UHCI that use I/O ports instead of MMIO.
+    pub fn io_base(&self) -> Option<u64> {
+        for bar in &self.bars {
+            if bar.bar_type == BarType::Io {
+                return Some(bar.address);
+            }
+        }
+        None
+    }
+
+    /// Check if this is a USB host controller
+    pub fn is_usb_controller(&self) -> bool {
+        self.class_code == CLASS_SERIAL && self.subclass == 0x03
+    }
 }
 
 /// Read a 32-bit value from PCI configuration space using legacy I/O
@@ -343,11 +360,11 @@ fn scan_device(bus: u8, device: u8, function: u8) -> Option<PciDevice> {
     Some(dev)
 }
 
-/// Enable bus mastering and memory space for a device
+/// Enable bus mastering, memory space, and I/O space for a device
 pub fn enable_device(dev: &PciDevice) {
     let cmd = pci_read_config_u16(dev.address, 0x04);
-    // Set bit 1 (memory space) and bit 2 (bus master)
-    let new_cmd = cmd | 0x06;
+    // Set bit 0 (I/O space), bit 1 (memory space) and bit 2 (bus master)
+    let new_cmd = cmd | 0x07;
 
     let aligned_offset = 0x04 & 0xFC;
     let current = pci_read_config_u32(dev.address, aligned_offset as u8);
