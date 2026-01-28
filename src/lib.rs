@@ -59,6 +59,9 @@ pub fn init(coreboot_table_ptr: u64) {
     // Initialize logging
     logger::init();
 
+    // Initialize PS/2 keyboard (if available)
+    drivers::keyboard::init();
+
     log::info!("CrabEFI v{} starting...", env!("CARGO_PKG_VERSION"));
     log::info!("Coreboot table pointer: {:#x}", coreboot_table_ptr);
 

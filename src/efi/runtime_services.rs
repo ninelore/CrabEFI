@@ -87,6 +87,14 @@ pub fn get_runtime_services() -> *mut efi::RuntimeServices {
     &raw mut RUNTIME_SERVICES
 }
 
+/// Get the address of runtime services code (for memory map reservation)
+///
+/// Returns the address of the set_virtual_address_map function, which is used
+/// to determine where the runtime services code section is located.
+pub fn get_runtime_code_address() -> u64 {
+    set_virtual_address_map as *const () as u64
+}
+
 // ============================================================================
 // Time Services
 // ============================================================================

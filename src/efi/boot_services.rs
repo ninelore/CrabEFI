@@ -4,9 +4,11 @@
 //! memory allocation, protocol handling, and image loading services.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
+use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::system_table;
+use crate::pe;
 use core::ffi::c_void;
-use r_efi::efi::{self, Boolean, Guid, Handle, Status, TableHeader, Tpl};
+use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
 use spin::Mutex;
 
@@ -110,6 +112,47 @@ static EVENTS: Mutex<[EventEntry; MAX_EVENTS]> =
     Mutex::new([const { EventEntry::empty() }; MAX_EVENTS]);
 static NEXT_EVENT_ID: Mutex<usize> = Mutex::new(2); // Start at 2, reserve 1 for keyboard
 
+/// Maximum number of loaded images we can track
+const MAX_LOADED_IMAGES: usize = 16;
+
+/// Loaded image entry - tracks PE images loaded via LoadImage
+#[derive(Clone, Copy)]
+struct LoadedImageEntry {
+    /// Handle for this loaded image
+    handle: Handle,
+    /// Base address where image was loaded
+    image_base: u64,
+    /// Size of the loaded image in bytes
+    image_size: u64,
+    /// Entry point address
+    entry_point: u64,
+    /// Number of pages allocated
+    num_pages: u64,
+    /// Parent image handle that loaded this image
+    parent_handle: Handle,
+}
+
+// Safety: LoadedImageEntry contains raw pointers but we only access them
+// while holding the LOADED_IMAGES lock, ensuring thread safety.
+unsafe impl Send for LoadedImageEntry {}
+
+impl LoadedImageEntry {
+    const fn empty() -> Self {
+        Self {
+            handle: core::ptr::null_mut(),
+            image_base: 0,
+            image_size: 0,
+            entry_point: 0,
+            num_pages: 0,
+            parent_handle: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Loaded images database - maps handles to their PE image info
+static LOADED_IMAGES: Mutex<[LoadedImageEntry; MAX_LOADED_IMAGES]> =
+    Mutex::new([const { LoadedImageEntry::empty() }; MAX_LOADED_IMAGES]);
+
 /// Static boot services table
 static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     hdr: TableHeader {
@@ -157,8 +200,40 @@ static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
     protocols_per_handle: protocols_per_handle,
     locate_handle_buffer: locate_handle_buffer,
     locate_protocol: locate_protocol,
-    install_multiple_protocol_interfaces: install_multiple_protocol_interfaces,
-    uninstall_multiple_protocol_interfaces: uninstall_multiple_protocol_interfaces,
+    // These are variadic functions - we use transmute to cast our extended-signature
+    // functions to the expected type. The caller passes all args regardless of signature.
+    install_multiple_protocol_interfaces: unsafe {
+        core::mem::transmute::<
+            extern "efiapi" fn(
+                *mut Handle,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> Status,
+            extern "efiapi" fn(*mut Handle, *mut c_void, *mut c_void) -> Status,
+        >(install_multiple_protocol_interfaces)
+    },
+    uninstall_multiple_protocol_interfaces: unsafe {
+        core::mem::transmute::<
+            extern "efiapi" fn(
+                Handle,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> Status,
+            extern "efiapi" fn(Handle, *mut c_void, *mut c_void) -> Status,
+        >(uninstall_multiple_protocol_interfaces)
+    },
     calculate_crc32: calculate_crc32,
     copy_mem: copy_mem,
     set_mem: set_mem,
@@ -425,8 +500,8 @@ extern "efiapi" fn wait_for_event(
 
             // Check if it's the keyboard event and there's input
             if event_id == KEYBOARD_EVENT_ID || has_keyboard_event {
-                // Check if serial port has data
-                if crate::drivers::serial::has_input() {
+                // Check if serial port or PS/2 keyboard has data
+                if crate::drivers::serial::has_input() || crate::drivers::keyboard::has_key() {
                     unsafe { *index = i };
                     log::debug!("  -> SUCCESS (keyboard input ready, index={})", i);
                     return Status::SUCCESS;
@@ -482,7 +557,8 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
 
     // Special case for keyboard event
     if event_id == KEYBOARD_EVENT_ID {
-        if crate::drivers::serial::has_input() {
+        // Check serial port or PS/2 keyboard for input
+        if crate::drivers::serial::has_input() || crate::drivers::keyboard::has_key() {
             return Status::SUCCESS;
         } else {
             return Status::NOT_READY;
@@ -720,10 +796,84 @@ extern "efiapi" fn locate_handle(
 }
 
 extern "efiapi" fn locate_device_path(
-    _protocol: *mut Guid,
-    _device_path: *mut *mut DevicePathProtocol,
-    _device: *mut Handle,
+    protocol: *mut Guid,
+    device_path: *mut *mut DevicePathProtocol,
+    device: *mut Handle,
 ) -> Status {
+    if protocol.is_null() || device_path.is_null() || device.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let guid = unsafe { *protocol };
+    let guid_name = format_guid(&guid);
+    log::debug!("BS.LocateDevicePath(protocol={})", guid_name);
+    if guid_name == "UNKNOWN" {
+        log_guid(&guid);
+    }
+
+    let input_dp = unsafe { *device_path };
+    if input_dp.is_null() {
+        log::debug!("  -> INVALID_PARAMETER (device_path is NULL)");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Find all handles with the specified protocol
+    let handles = HANDLES.lock();
+    let count = HANDLE_COUNT.lock();
+
+    for i in 0..*count {
+        let mut has_protocol = false;
+        let mut handle_dp: *mut DevicePathProtocol = core::ptr::null_mut();
+
+        for j in 0..handles[i].protocol_count {
+            if guid_eq(&handles[i].protocols[j].guid, &guid) {
+                has_protocol = true;
+            }
+            // Also look for DEVICE_PATH protocol to get the device path
+            if guid_eq(
+                &handles[i].protocols[j].guid,
+                &r_efi::protocols::device_path::PROTOCOL_GUID,
+            ) {
+                handle_dp = handles[i].protocols[j].interface as *mut DevicePathProtocol;
+            }
+        }
+
+        if has_protocol && !handle_dp.is_null() {
+            // For the initrd case, GRUB installs a handle with LOAD_FILE2 and a vendor media
+            // device path. The kernel passes in that same device path to find it.
+
+            log::debug!(
+                "  -> SUCCESS (handle={:?}, device_path={:?})",
+                handles[i].handle,
+                handle_dp
+            );
+            unsafe {
+                *device = handles[i].handle;
+                // Update device_path to point to the End node of the handle's device path.
+                // The LoadFile2 protocol expects the remaining path after the match.
+                // Walk to the end of the device path and point to the End node.
+                let mut dp = handle_dp;
+                loop {
+                    let dp_type = (*dp).r#type;
+                    let dp_subtype = (*dp).sub_type;
+                    // End of device path: type 0x7F, subtype 0xFF
+                    if dp_type == 0x7f && dp_subtype == 0xff {
+                        break;
+                    }
+                    // Get length and move to next node
+                    let len = u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize;
+                    if len < 4 {
+                        break; // Invalid length, stop
+                    }
+                    dp = (dp as *const u8).add(len) as *mut DevicePathProtocol;
+                }
+                *device_path = dp;
+            }
+            return Status::SUCCESS;
+        }
+    }
+
+    log::debug!("  -> NOT_FOUND");
     Status::NOT_FOUND
 }
 
@@ -743,28 +893,230 @@ extern "efiapi" fn install_configuration_table(guid: *mut Guid, table: *mut c_vo
 extern "efiapi" fn load_image(
     boot_policy: Boolean,
     parent_image_handle: Handle,
-    _device_path: *mut DevicePathProtocol,
+    device_path: *mut DevicePathProtocol,
     source_buffer: *mut c_void,
     source_size: usize,
-    _image_handle: *mut Handle,
+    image_handle: *mut Handle,
 ) -> Status {
     log::debug!(
-        "BS.LoadImage(boot_policy={:?}, parent={:?}, buf={:?}, size={}) -> UNSUPPORTED",
+        "BS.LoadImage(boot_policy={:?}, parent={:?}, device_path={:?}, buf={:?}, size={})",
         boot_policy,
         parent_image_handle,
+        device_path,
         source_buffer,
         source_size
     );
-    Status::UNSUPPORTED
+
+    // Validate parameters
+    if image_handle.is_null() {
+        log::error!("BS.LoadImage: image_handle is NULL");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // We only support loading from a memory buffer currently
+    if source_buffer.is_null() || source_size == 0 {
+        log::error!("BS.LoadImage: source_buffer is NULL or size is 0");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Create a slice from the source buffer
+    let data = unsafe { core::slice::from_raw_parts(source_buffer as *const u8, source_size) };
+
+    // Load the PE image using our PE loader
+    let loaded_image = match pe::load_image(data) {
+        Ok(img) => img,
+        Err(status) => {
+            log::error!("BS.LoadImage: Failed to load PE image: {:?}", status);
+            return status;
+        }
+    };
+
+    log::debug!(
+        "BS.LoadImage: PE loaded at {:#x}, entry={:#x}, size={:#x}",
+        loaded_image.image_base,
+        loaded_image.entry_point,
+        loaded_image.image_size
+    );
+
+    // Create a new handle for this image
+    let new_handle = match create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("BS.LoadImage: Failed to create handle");
+            pe::unload_image(&loaded_image);
+            return Status::OUT_OF_RESOURCES;
+        }
+    };
+
+    // Create LoadedImageProtocol for this image
+    // Get the parent's device handle if available
+    let device_handle = get_device_handle_from_parent(parent_image_handle);
+
+    let system_table = super::get_system_table();
+    let loaded_image_protocol = create_loaded_image_protocol(
+        parent_image_handle,
+        system_table,
+        device_handle,
+        loaded_image.image_base,
+        loaded_image.image_size,
+    );
+
+    if loaded_image_protocol.is_null() {
+        log::error!("BS.LoadImage: Failed to create LoadedImageProtocol");
+        pe::unload_image(&loaded_image);
+        return Status::OUT_OF_RESOURCES;
+    }
+
+    // Set the device path on the loaded image if provided
+    if !device_path.is_null() {
+        unsafe {
+            super::protocols::loaded_image::set_file_path(loaded_image_protocol, device_path);
+        }
+    }
+
+    // Install the LoadedImageProtocol on the handle
+    let status = install_protocol(
+        new_handle,
+        &LOADED_IMAGE_PROTOCOL_GUID,
+        loaded_image_protocol as *mut c_void,
+    );
+
+    if status != Status::SUCCESS {
+        log::error!(
+            "BS.LoadImage: Failed to install LoadedImageProtocol: {:?}",
+            status
+        );
+        pe::unload_image(&loaded_image);
+        return status;
+    }
+
+    // Store the loaded image info so StartImage can find it
+    {
+        let mut images = LOADED_IMAGES.lock();
+        let mut stored = false;
+        for entry in images.iter_mut() {
+            if entry.handle.is_null() {
+                entry.handle = new_handle;
+                entry.image_base = loaded_image.image_base;
+                entry.image_size = loaded_image.image_size;
+                entry.entry_point = loaded_image.entry_point;
+                entry.num_pages = loaded_image.num_pages;
+                entry.parent_handle = parent_image_handle;
+                stored = true;
+                break;
+            }
+        }
+        if !stored {
+            log::error!("BS.LoadImage: No space in loaded images table");
+            pe::unload_image(&loaded_image);
+            return Status::OUT_OF_RESOURCES;
+        }
+    }
+
+    // Return the new handle
+    unsafe {
+        *image_handle = new_handle;
+    }
+
+    log::info!(
+        "BS.LoadImage: SUCCESS - handle={:?}, base={:#x}, entry={:#x}",
+        new_handle,
+        loaded_image.image_base,
+        loaded_image.entry_point
+    );
+
+    Status::SUCCESS
+}
+
+/// Get the device handle from a parent image's LoadedImageProtocol
+fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
+    if parent_handle.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    // Try to get the LoadedImageProtocol from the parent
+    let handles = HANDLES.lock();
+    for entry in handles.iter() {
+        if entry.handle == parent_handle {
+            for proto in &entry.protocols[..entry.protocol_count] {
+                if proto.guid == LOADED_IMAGE_PROTOCOL_GUID && !proto.interface.is_null() {
+                    let loaded_image = unsafe {
+                        &*(proto.interface as *const r_efi::protocols::loaded_image::Protocol)
+                    };
+                    return loaded_image.device_handle;
+                }
+            }
+            break;
+        }
+    }
+    core::ptr::null_mut()
 }
 
 extern "efiapi" fn start_image(
     image_handle: Handle,
-    _exit_data_size: *mut usize,
-    _exit_data: *mut *mut u16,
+    exit_data_size: *mut usize,
+    exit_data: *mut *mut u16,
 ) -> Status {
-    log::debug!("BS.StartImage(handle={:?}) -> UNSUPPORTED", image_handle);
-    Status::UNSUPPORTED
+    log::debug!("BS.StartImage(handle={:?})", image_handle);
+
+    if image_handle.is_null() {
+        log::error!("BS.StartImage: image_handle is NULL");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Find the loaded image entry
+    let (entry_point, image_base) = {
+        let images = LOADED_IMAGES.lock();
+        let mut found = None;
+        for entry in images.iter() {
+            if entry.handle == image_handle {
+                found = Some((entry.entry_point, entry.image_base));
+                break;
+            }
+        }
+        match found {
+            Some(info) => info,
+            None => {
+                log::error!(
+                    "BS.StartImage: handle {:?} not found in loaded images",
+                    image_handle
+                );
+                return Status::INVALID_PARAMETER;
+            }
+        }
+    };
+
+    log::info!(
+        "BS.StartImage: Executing image at {:#x} (base={:#x})",
+        entry_point,
+        image_base
+    );
+
+    // Get the system table
+    let system_table = super::get_system_table();
+
+    // Define the entry point function type
+    type EfiEntryPoint = extern "efiapi" fn(Handle, *mut SystemTable) -> Status;
+
+    // Call the entry point
+    let entry: EfiEntryPoint = unsafe { core::mem::transmute(entry_point) };
+    let status = entry(image_handle, system_table);
+
+    log::info!("BS.StartImage: Image returned with status: {:?}", status);
+
+    // Set exit data if provided (we don't support exit data currently)
+    if !exit_data_size.is_null() {
+        unsafe {
+            *exit_data_size = 0;
+        }
+    }
+    if !exit_data.is_null() {
+        unsafe {
+            *exit_data = core::ptr::null_mut();
+        }
+    }
+
+    status
 }
 
 extern "efiapi" fn exit(
@@ -779,12 +1131,63 @@ extern "efiapi" fn exit(
         exit_status,
         exit_data_size
     );
-    Status::UNSUPPORTED
+    // Note: A proper Exit implementation would use longjmp to return
+    // from the corresponding StartImage call. For now, we just return
+    // the status - this works for simple cases but won't properly unwind
+    // nested image calls.
+    exit_status
 }
 
 extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
-    log::debug!("BS.UnloadImage(handle={:?}) -> UNSUPPORTED", image_handle);
-    Status::UNSUPPORTED
+    log::debug!("BS.UnloadImage(handle={:?})", image_handle);
+
+    if image_handle.is_null() {
+        log::error!("BS.UnloadImage: image_handle is NULL");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Find and remove the loaded image entry
+    let image_info = {
+        let mut images = LOADED_IMAGES.lock();
+        let mut found = None;
+        for entry in images.iter_mut() {
+            if entry.handle == image_handle {
+                found = Some((entry.image_base, entry.num_pages));
+                // Clear the entry
+                *entry = LoadedImageEntry::empty();
+                break;
+            }
+        }
+        found
+    };
+
+    match image_info {
+        Some((image_base, num_pages)) => {
+            // Free the image memory
+            let status = allocator::free_pages(image_base, num_pages);
+            if status != Status::SUCCESS {
+                log::warn!(
+                    "BS.UnloadImage: Failed to free pages at {:#x}: {:?}",
+                    image_base,
+                    status
+                );
+            }
+
+            // Remove protocols from the handle
+            // Note: In a full implementation, we should uninstall all protocols
+            // For now, we just log success
+            log::debug!("BS.UnloadImage: SUCCESS");
+            Status::SUCCESS
+        }
+        None => {
+            log::warn!(
+                "BS.UnloadImage: handle {:?} not found in loaded images",
+                image_handle
+            );
+            // Return success anyway - the handle might have been loaded differently
+            Status::SUCCESS
+        }
+    }
 }
 
 extern "efiapi" fn exit_boot_services(image_handle: Handle, map_key: usize) -> Status {
@@ -988,23 +1391,150 @@ extern "efiapi" fn locate_protocol(
     Status::NOT_FOUND
 }
 
-// Note: These are variadic in the real UEFI spec, but Rust doesn't support
-// variadic functions with efiapi calling convention. We implement them as
-// fixed-argument stubs that always return UNSUPPORTED.
+// Note: These are variadic in the real UEFI spec. We handle this by accepting
+// enough arguments for the common case (up to 4 protocol pairs) and iterating
+// until we find a NULL GUID terminator.
 extern "efiapi" fn install_multiple_protocol_interfaces(
-    _handle: *mut Handle,
-    _arg1: *mut c_void,
-    _arg2: *mut c_void,
+    handle: *mut Handle,
+    // Variadic args come as pairs: (GUID*, interface*), terminated by NULL
+    arg1: *mut c_void,
+    arg2: *mut c_void,
+    arg3: *mut c_void,
+    arg4: *mut c_void,
+    arg5: *mut c_void,
+    arg6: *mut c_void,
+    arg7: *mut c_void,
+    arg8: *mut c_void,
 ) -> Status {
-    Status::UNSUPPORTED
+    if handle.is_null() {
+        log::debug!("BS.InstallMultipleProtocolInterfaces: handle ptr is NULL");
+        return Status::INVALID_PARAMETER;
+    }
+
+    // Collect the argument pairs
+    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
+
+    // Count how many valid protocol pairs we have (until NULL GUID)
+    let mut pair_count = 0;
+    for (guid_ptr, _iface_ptr) in &args {
+        if guid_ptr.is_null() {
+            break;
+        }
+        pair_count += 1;
+    }
+
+    log::debug!(
+        "BS.InstallMultipleProtocolInterfaces(handle={:?}, {} protocols)",
+        unsafe { *handle },
+        pair_count
+    );
+
+    if pair_count == 0 {
+        // No protocols to install, just return success
+        return Status::SUCCESS;
+    }
+
+    // If handle points to NULL, create a new handle
+    let target_handle = if unsafe { (*handle).is_null() } {
+        match create_handle() {
+            Some(h) => {
+                unsafe { *handle = h };
+                log::debug!("  Created new handle: {:?}", h);
+                h
+            }
+            None => {
+                log::error!("  Failed to create handle");
+                return Status::OUT_OF_RESOURCES;
+            }
+        }
+    } else {
+        unsafe { *handle }
+    };
+
+    // Install each protocol
+    for i in 0..pair_count {
+        let guid_ptr = args[i].0 as *mut Guid;
+        let interface = args[i].1;
+
+        if guid_ptr.is_null() {
+            break;
+        }
+
+        let guid = unsafe { *guid_ptr };
+        let guid_name = format_guid(&guid);
+        log::debug!("  Installing protocol: {}", guid_name);
+        if guid_name == "UNKNOWN" {
+            log_guid(&guid);
+        }
+
+        let status = install_protocol(target_handle, &guid, interface);
+        if status != Status::SUCCESS {
+            log::error!("  Failed to install protocol {}: {:?}", guid_name, status);
+            // On failure, we should uninstall previously installed protocols
+            // For simplicity, we just return the error
+            return status;
+        }
+    }
+
+    log::debug!("  -> SUCCESS");
+    Status::SUCCESS
 }
 
 extern "efiapi" fn uninstall_multiple_protocol_interfaces(
-    _handle: Handle,
-    _arg1: *mut c_void,
-    _arg2: *mut c_void,
+    handle: Handle,
+    arg1: *mut c_void,
+    arg2: *mut c_void,
+    arg3: *mut c_void,
+    arg4: *mut c_void,
+    arg5: *mut c_void,
+    arg6: *mut c_void,
+    arg7: *mut c_void,
+    arg8: *mut c_void,
 ) -> Status {
-    Status::UNSUPPORTED
+    log::debug!(
+        "BS.UninstallMultipleProtocolInterfaces(handle={:?})",
+        handle
+    );
+
+    if handle.is_null() {
+        return Status::INVALID_PARAMETER;
+    }
+
+    let args = [(arg1, arg2), (arg3, arg4), (arg5, arg6), (arg7, arg8)];
+
+    // Uninstall each protocol
+    for (guid_ptr, _iface_ptr) in &args {
+        if guid_ptr.is_null() {
+            break;
+        }
+
+        let guid = unsafe { *(*guid_ptr as *const Guid) };
+        let guid_name = format_guid(&guid);
+        log::debug!("  Uninstalling protocol: {}", guid_name);
+
+        // Find and remove the protocol from the handle
+        let mut handles = HANDLES.lock();
+        let count = HANDLE_COUNT.lock();
+
+        for i in 0..*count {
+            if handles[i].handle == handle {
+                for j in 0..handles[i].protocol_count {
+                    if guid_eq(&handles[i].protocols[j].guid, &guid) {
+                        // Remove by shifting remaining protocols down
+                        for k in j..handles[i].protocol_count - 1 {
+                            handles[i].protocols[k] = handles[i].protocols[k + 1];
+                        }
+                        handles[i].protocol_count -= 1;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    log::debug!("  -> SUCCESS");
+    Status::SUCCESS
 }
 
 extern "efiapi" fn calculate_crc32(
