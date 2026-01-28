@@ -215,7 +215,7 @@ extern "efiapi" fn gop_blt(
     height: usize,
     delta: usize,
 ) -> Status {
-    log::trace!(
+    log::debug!(
         "GOP.Blt(op={:?}, src=({},{}), dst=({},{}), size={}x{}, delta={})",
         blt_operation,
         source_x,

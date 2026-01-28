@@ -255,7 +255,7 @@ extern "efiapi" fn file_open(
     let name_len = utf16_to_utf8(file_name, &mut utf8_name);
     let name_str = core::str::from_utf8(&utf8_name[..name_len]).unwrap_or("");
 
-    log::debug!("File.Open({:?})", name_str);
+    log::info!("File.Open({:?})", name_str);
 
     // Get parent handle info
     let (parent_path, parent_path_len) = {
@@ -275,7 +275,7 @@ extern "efiapi" fn file_open(
     let full_path_len = build_full_path(&parent_path[..parent_path_len], name_str, &mut full_path);
     let full_path_str = core::str::from_utf8(&full_path[..full_path_len]).unwrap_or("");
 
-    log::debug!("File.Open: full path = {:?}", full_path_str);
+    log::info!("File.Open: full path = {:?}", full_path_str);
 
     // Look up the file in the filesystem
     let state = match *FS_STATE.lock() {

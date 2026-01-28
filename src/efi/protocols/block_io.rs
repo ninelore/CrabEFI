@@ -45,7 +45,6 @@ pub struct BlockIoMedia {
     /// Last logical block address
     pub last_block: u64,
 }
-
 /// Block I/O Protocol structure
 #[repr(C)]
 pub struct BlockIoProtocol {
