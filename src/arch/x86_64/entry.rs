@@ -18,6 +18,8 @@ impl PageTable {
 }
 
 // Page tables - placed in a specific section
+// We need to identity-map enough memory for UEFI applications.
+// 64GB requires 64 Page Directories (64 * 512 * 2MB = 64GB)
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
 pub static mut PML4: PageTable = PageTable::empty();
@@ -26,14 +28,14 @@ pub static mut PML4: PageTable = PageTable::empty();
 #[unsafe(link_section = ".page_tables")]
 pub static mut PDPT: PageTable = PageTable::empty();
 
+/// Number of Page Directories for identity mapping
+/// 64 PDs * 512 entries * 2MB per entry = 64GB
+pub const NUM_PAGE_DIRECTORIES: usize = 64;
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".page_tables")]
-pub static mut PD: [PageTable; 4] = [
-    PageTable::empty(),
-    PageTable::empty(),
-    PageTable::empty(),
-    PageTable::empty(),
-];
+pub static mut PD: [PageTable; NUM_PAGE_DIRECTORIES] =
+    [const { PageTable::empty() }; NUM_PAGE_DIRECTORIES];
 
 // GDT for 64-bit mode
 #[repr(C, align(16))]
@@ -85,30 +87,25 @@ _start:
     mov [edi], eax
     mov dword ptr [edi + 4], 0
     
-    // Set up PDPT[0-3] -> PD[0-3]
+    // Set up PDPT[0-63] -> PD[0-63] for 64GB identity mapping
     lea eax, [PD]
-    or eax, 0x03
+    or eax, 0x03              // Present + Writable
     lea edi, [PDPT]
+    mov ecx, 64               // 64 PDPT entries for 64GB
+    
+.Lfill_pdpt:
     mov [edi], eax
     mov dword ptr [edi + 4], 0
+    add eax, 0x1000           // Next PD (4KB apart)
+    add edi, 8
+    dec ecx
+    jnz .Lfill_pdpt
     
-    add eax, 0x1000
-    mov [edi + 8], eax
-    mov dword ptr [edi + 12], 0
-    
-    add eax, 0x1000
-    mov [edi + 16], eax
-    mov dword ptr [edi + 20], 0
-    
-    add eax, 0x1000
-    mov [edi + 24], eax
-    mov dword ptr [edi + 28], 0
-    
-    // Set up PD entries - identity map first 4GB with 2MB pages
+    // Set up PD entries - identity map first 64GB with 2MB pages
     lea edi, [PD]
     mov eax, 0x83             // Present + Writable + PageSize (2MB)
     xor edx, edx              // High 32 bits
-    mov ecx, 2048             // 512 entries * 4 PDs
+    mov ecx, 32768            // 512 entries * 64 PDs = 32768 entries
     
 .Lfill_pd:
     mov [edi], eax

@@ -84,7 +84,7 @@ impl PageTable {
 
 /// Initialize paging based on the memory map
 ///
-/// The initial page tables set up in assembly identity-map the first 4GB.
+/// The initial page tables set up in assembly identity-map the first 64GB.
 /// This function can be used to refine the mapping based on the actual
 /// memory map from coreboot.
 pub fn init(memory_map: &[MemoryRegion]) {

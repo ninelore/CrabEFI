@@ -18,6 +18,11 @@ pub const PAGE_SIZE: u64 = 4096;
 /// Page size as usize for convenience
 pub const PAGE_SIZE_USIZE: usize = 4096;
 
+/// Maximum address that is identity-mapped in page tables
+/// Our assembly code sets up identity mapping for the first 64GB (64 PDPTs * 512 PDs * 2MB each)
+/// Allocations above this address will cause page faults!
+const MAX_IDENTITY_MAPPED_ADDRESS: u64 = 0x10_0000_0000; // 64GB
+
 /// EFI memory allocation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -193,9 +198,18 @@ impl MemoryAllocator {
         self.entries.clear();
         self.map_key = 1;
 
+        log::info!("Importing coreboot memory map ({} regions):", regions.len());
         for region in regions {
             let memory_type = cb_to_efi_memory_type(region.region_type);
             let num_pages = (region.size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+            log::info!(
+                "  {:#010x}-{:#010x} {:?} -> {:?}",
+                region.start,
+                region.start + region.size,
+                region.region_type,
+                memory_type
+            );
 
             // Default attributes: Write-Back for RAM, uncacheable for others
             let attribute = match memory_type {
@@ -225,7 +239,7 @@ impl MemoryAllocator {
         // Merge adjacent regions of the same type
         self.merge_entries();
 
-        log::debug!(
+        log::info!(
             "Memory allocator initialized with {} entries",
             self.entries.len()
         );
@@ -240,6 +254,39 @@ impl MemoryAllocator {
         memory_type: MemoryType,
     ) -> Result<(), efi::Status> {
         self.carve_out(physical_start, num_pages, memory_type)
+    }
+
+    /// Force-add a memory region to the map
+    ///
+    /// This is used when the region isn't in the coreboot map at all.
+    /// It adds the region directly without trying to carve from existing memory.
+    pub fn force_add_region(
+        &mut self,
+        physical_start: u64,
+        num_pages: u64,
+        memory_type: MemoryType,
+    ) -> Result<(), efi::Status> {
+        let mut attribute = attributes::EFI_MEMORY_WB;
+
+        // RuntimeServicesCode/Data must have EFI_MEMORY_RUNTIME attribute
+        if memory_type == MemoryType::RuntimeServicesCode {
+            attribute |= attributes::EFI_MEMORY_RUNTIME;
+            attribute &= !attributes::EFI_MEMORY_XP;
+        } else if memory_type == MemoryType::RuntimeServicesData {
+            attribute |= attributes::EFI_MEMORY_RUNTIME;
+            attribute |= attributes::EFI_MEMORY_XP;
+        }
+
+        let desc = MemoryDescriptor::new(memory_type, physical_start, num_pages, attribute);
+
+        if self.entries.push(desc).is_err() {
+            return Err(efi::Status::OUT_OF_RESOURCES);
+        }
+
+        self.map_key += 1;
+        self.sort_entries();
+
+        Ok(())
     }
 
     /// Allocate pages of memory
@@ -397,11 +444,47 @@ impl MemoryAllocator {
 
     /// Mark boot services as exited
     pub fn exit_boot_services(&mut self, provided_map_key: usize) -> efi::Status {
+        log::debug!(
+            "exit_boot_services: provided_key={:#x}, current_key={:#x}",
+            provided_map_key,
+            self.map_key
+        );
+
         if provided_map_key != self.map_key {
+            log::warn!(
+                "exit_boot_services: map_key mismatch! expected {:#x}, got {:#x}",
+                self.map_key,
+                provided_map_key
+            );
             return efi::Status::INVALID_PARAMETER;
         }
 
         self.boot_services_exited = true;
+
+        // Log runtime services regions (these must have EFI_MEMORY_RUNTIME attribute)
+        log::debug!(
+            "Memory map at ExitBootServices ({} entries):",
+            self.entries.len()
+        );
+        for entry in self.entries.iter() {
+            let mem_type = entry
+                .get_memory_type()
+                .unwrap_or(MemoryType::ReservedMemoryType);
+            let has_runtime = (entry.attribute & attributes::EFI_MEMORY_RUNTIME) != 0;
+            if matches!(
+                mem_type,
+                MemoryType::RuntimeServicesCode | MemoryType::RuntimeServicesData
+            ) {
+                log::info!(
+                    "  RuntimeServices: {:#x}-{:#x} type={:?} attr={:#x} RUNTIME={}",
+                    entry.physical_start,
+                    entry.end(),
+                    mem_type,
+                    entry.attribute,
+                    has_runtime
+                );
+            }
+        }
 
         // Convert boot services memory to conventional memory
         for entry in self.entries.iter_mut() {
@@ -415,6 +498,7 @@ impl MemoryAllocator {
         self.map_key += 1;
         self.merge_entries();
 
+        log::info!("ExitBootServices complete, new map_key={:#x}", self.map_key);
         efi::Status::SUCCESS
     }
 
@@ -422,9 +506,19 @@ impl MemoryAllocator {
     fn find_free_pages(&self, num_pages: u64, max_addr: u64) -> Option<u64> {
         let size = num_pages * PAGE_SIZE;
 
-        // Search from high to low addresses (prefer high memory)
+        // Limit max_addr to the identity-mapped region
+        // Our page tables only cover the first 4GB, so allocating above that
+        // would cause page faults when the memory is accessed
+        let max_addr = max_addr.min(MAX_IDENTITY_MAPPED_ADDRESS);
+
+        // Search from high to low addresses (prefer high memory within mapped region)
         for entry in self.entries.iter().rev() {
             if entry.get_memory_type() != Some(MemoryType::ConventionalMemory) {
+                continue;
+            }
+
+            // Skip entries entirely above our limit
+            if entry.physical_start >= max_addr {
                 continue;
             }
 
@@ -604,6 +698,18 @@ pub fn reserve_region(
     alloc.reserve_region(physical_start, num_pages, memory_type)
 }
 
+/// Force-add a memory region to the map
+///
+/// This is used when the region isn't in the coreboot map at all.
+pub fn force_add_region(
+    physical_start: u64,
+    num_pages: u64,
+    memory_type: MemoryType,
+) -> Result<(), efi::Status> {
+    let mut alloc = ALLOCATOR.lock();
+    alloc.force_add_region(physical_start, num_pages, memory_type)
+}
+
 /// Allocate pages of memory
 pub fn allocate_pages(
     alloc_type: AllocateType,
@@ -744,13 +850,28 @@ pub fn reserve_runtime_region() {
     let data_end = unsafe { &__runtime_data_end as *const u8 as u64 };
 
     // Align to page boundaries
+    // Code region: round start down, round end up
     let code_start_aligned = code_start & !(PAGE_SIZE - 1);
     let code_end_aligned = (code_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let data_start_aligned = data_start & !(PAGE_SIZE - 1);
+
+    // Data region: start where code ends (to avoid overlap), round end up
+    // The linker places data_start immediately after code_end, but when we
+    // page-align them separately, rounding code_end UP and data_start DOWN
+    // can create an overlap. Instead, always start data at code_end_aligned.
+    let data_start_aligned = if data_start < code_end_aligned {
+        // Data would overlap with code region, start at code_end instead
+        code_end_aligned
+    } else {
+        data_start & !(PAGE_SIZE - 1)
+    };
     let data_end_aligned = (data_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     let code_pages = (code_end_aligned - code_start_aligned) / PAGE_SIZE;
-    let data_pages = (data_end_aligned - data_start_aligned) / PAGE_SIZE;
+    let data_pages = if data_end_aligned > data_start_aligned {
+        (data_end_aligned - data_start_aligned) / PAGE_SIZE
+    } else {
+        0
+    };
 
     log::info!(
         "Runtime code region from linker: {:#x}-{:#x} ({} pages)",
@@ -780,30 +901,67 @@ pub fn reserve_runtime_region() {
         }
         Err(status) => {
             log::warn!(
-                "Failed to reserve runtime code region: {:?} (may already be allocated)",
+                "carve_out failed for code region: {:?}, trying force_add",
                 status
             );
+            // The region might not be in the memory map at all - force add it
+            match force_add_region(
+                code_start_aligned,
+                code_pages,
+                MemoryType::RuntimeServicesCode,
+            ) {
+                Ok(()) => {
+                    log::info!(
+                        "Force-added runtime services code region: {:#x}-{:#x}",
+                        code_start_aligned,
+                        code_end_aligned
+                    );
+                }
+                Err(e) => {
+                    log::error!("CRITICAL: Failed to add runtime code region: {:?}", e);
+                }
+            }
         }
     }
 
     // Reserve the DATA region (non-executable, XP attribute set)
-    match reserve_region(
-        data_start_aligned,
-        data_pages,
-        MemoryType::RuntimeServicesData,
-    ) {
-        Ok(()) => {
-            log::info!(
-                "Reserved runtime services data region: {:#x}-{:#x}",
-                data_start_aligned,
-                data_end_aligned
-            );
-        }
-        Err(status) => {
-            log::warn!(
-                "Failed to reserve runtime data region: {:?} (may already be allocated)",
-                status
-            );
+    // Skip if there are no pages to reserve
+    if data_pages > 0 {
+        match reserve_region(
+            data_start_aligned,
+            data_pages,
+            MemoryType::RuntimeServicesData,
+        ) {
+            Ok(()) => {
+                log::info!(
+                    "Reserved runtime services data region: {:#x}-{:#x}",
+                    data_start_aligned,
+                    data_end_aligned
+                );
+            }
+            Err(status) => {
+                log::warn!(
+                    "carve_out failed for data region: {:?}, trying force_add",
+                    status
+                );
+                // The region might not be in the memory map at all - force add it
+                match force_add_region(
+                    data_start_aligned,
+                    data_pages,
+                    MemoryType::RuntimeServicesData,
+                ) {
+                    Ok(()) => {
+                        log::info!(
+                            "Force-added runtime services data region: {:#x}-{:#x}",
+                            data_start_aligned,
+                            data_end_aligned
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("CRITICAL: Failed to add runtime data region: {:?}", e);
+                    }
+                }
+            }
         }
     }
 }
