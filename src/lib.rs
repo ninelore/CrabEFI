@@ -156,11 +156,15 @@ fn init_storage() {
 
 /// Try to boot from NVMe
 fn try_boot_from_nvme() -> bool {
+    use drivers::storage::{self, StorageType};
+
     if let Some(controller) = drivers::nvme::get_controller(0) {
         log::info!("Probing NVMe controller for ESP...");
 
         if let Some(ns) = controller.default_namespace() {
             let nsid = ns.nsid;
+            let num_blocks = ns.num_blocks;
+            let block_size = ns.block_size;
 
             // Store the device globally for SimpleFileSystem protocol
             if !drivers::nvme::store_global_device(0, nsid) {
@@ -168,55 +172,50 @@ fn try_boot_from_nvme() -> bool {
                 return false;
             }
 
+            // Register with storage abstraction (needed for BlockIO)
+            let storage_id = match storage::register_device(
+                StorageType::Nvme {
+                    controller_id: 0,
+                    nsid,
+                },
+                num_blocks,
+                block_size,
+            ) {
+                Some(id) => id,
+                None => {
+                    log::error!("Failed to register NVMe device with storage");
+                    return false;
+                }
+            };
+
             // Get actual PCI address from the controller before creating disk (which borrows it)
             let pci_addr = controller.pci_address();
 
             let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
 
-            // Read GPT to find ESP with partition number
-            let header = match fs::gpt::read_gpt_header(&mut disk) {
-                Ok(h) => h,
-                Err(e) => {
-                    log::debug!("No GPT found on NVMe: {:?}", e);
-                    return false;
-                }
-            };
-
-            let partitions = match fs::gpt::read_partitions(&mut disk, &header) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("Failed to read partitions: {:?}", e);
-                    return false;
-                }
-            };
-
-            // Find ESP and its partition number
-            let mut esp_info: Option<(u32, fs::gpt::Partition)> = None;
-            for (i, partition) in partitions.iter().enumerate() {
-                if partition.is_esp {
-                    let partition_num = (i + 1) as u32;
-                    log::info!(
-                        "Found ESP on NVMe: partition {}, LBA {}-{} ({} MB)",
+            // Install BlockIO for all partitions and find ESP
+            if let Some((partition_num, esp)) = install_block_io_for_nvme_disk(
+                &mut disk,
+                storage_id,
+                block_size,
+                num_blocks,
+                pci_addr.device,
+                pci_addr.function,
+                nsid,
+            ) {
+                // Re-create disk since install_block_io_for_nvme_disk consumed it
+                if let Some(controller) = drivers::nvme::get_controller(0) {
+                    let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+                    if try_boot_from_esp_nvme(
+                        &mut disk,
+                        &esp,
                         partition_num,
-                        partition.first_lba,
-                        partition.last_lba,
-                        partition.size_bytes() / (1024 * 1024)
-                    );
-                    esp_info = Some((partition_num, partition.clone()));
-                    break;
-                }
-            }
-
-            if let Some((partition_num, esp)) = esp_info {
-                if try_boot_from_esp_nvme(
-                    &mut disk,
-                    &esp,
-                    partition_num,
-                    pci_addr.device,
-                    pci_addr.function,
-                    nsid,
-                ) {
-                    return true;
+                        pci_addr.device,
+                        pci_addr.function,
+                        nsid,
+                    ) {
+                        return true;
+                    }
                 }
             } else {
                 log::debug!("No ESP found on NVMe");
@@ -228,29 +227,71 @@ fn try_boot_from_nvme() -> bool {
 
 /// Try to boot from AHCI/SATA
 fn try_boot_from_ahci() -> bool {
+    use drivers::storage::{self, StorageType};
+
     if let Some(controller) = drivers::ahci::get_controller(0) {
         for port_index in 0..controller.num_active_ports() {
             log::info!("Probing AHCI port {} for ESP...", port_index);
 
-            match fs::gpt::find_esp_on_ahci(controller, port_index) {
-                Ok(esp) => {
-                    log::info!(
-                        "Found ESP on AHCI port {}: LBA {}-{} ({} MB)",
-                        port_index,
-                        esp.first_lba,
-                        esp.last_lba,
-                        esp.size_bytes() / (1024 * 1024)
-                    );
+            // Get port info (num_blocks, block_size)
+            let (num_blocks, block_size) = match controller.get_port(port_index) {
+                Some(port) => (port.sector_count, port.sector_size),
+                None => continue,
+            };
 
+            // Store the device globally for SimpleFileSystem protocol
+            if !drivers::ahci::store_global_device(0, port_index) {
+                log::error!("Failed to store AHCI device globally");
+                continue;
+            }
+
+            // Register with storage abstraction (needed for BlockIO)
+            let storage_id = match storage::register_device(
+                StorageType::Ahci {
+                    controller_id: 0,
+                    port: port_index,
+                },
+                num_blocks,
+                block_size,
+            ) {
+                Some(id) => id,
+                None => {
+                    log::error!("Failed to register AHCI device with storage");
+                    continue;
+                }
+            };
+
+            // Get PCI address before creating disk (which borrows controller)
+            let pci_addr = controller.pci_address();
+
+            let mut disk = fs::gpt::AhciDisk::new(controller, port_index);
+
+            // Install BlockIO for all partitions and find ESP
+            if let Some((partition_num, esp)) = install_block_io_for_ahci_disk(
+                &mut disk,
+                storage_id,
+                block_size,
+                num_blocks,
+                pci_addr.device,
+                pci_addr.function,
+                port_index as u16,
+            ) {
+                // Re-create disk since install_block_io_for_ahci_disk consumed it
+                if let Some(controller) = drivers::ahci::get_controller(0) {
                     let mut disk = fs::gpt::AhciDisk::new(controller, port_index);
-
-                    if try_boot_from_esp(&mut disk, &esp) {
+                    if try_boot_from_esp_ahci(
+                        &mut disk,
+                        &esp,
+                        partition_num,
+                        pci_addr.device,
+                        pci_addr.function,
+                        port_index as u16,
+                    ) {
                         return true;
                     }
                 }
-                Err(e) => {
-                    log::debug!("No ESP found on AHCI port {}: {:?}", port_index, e);
-                }
+            } else {
+                log::debug!("No ESP found on AHCI port {}", port_index);
             }
         }
     }
@@ -528,6 +569,380 @@ fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
             partition_num
         );
         // Return the first candidate - the caller will try to mount it as FAT
+        return Some((*partition_num, partition.clone()));
+    }
+
+    None
+}
+
+/// Install BlockIO protocols for an NVMe disk and all its partitions
+///
+/// Returns the ESP partition and its partition number (1-based) if found.
+///
+/// # Arguments
+/// * `disk` - Disk to read GPT from
+/// * `storage_id` - Storage device ID for BlockIO
+/// * `block_size` - Block size in bytes
+/// * `num_blocks` - Total number of blocks
+/// * `pci_device` - PCI device number of the NVMe controller
+/// * `pci_function` - PCI function number
+/// * `namespace_id` - NVMe namespace ID
+fn install_block_io_for_nvme_disk<R: fs::gpt::SectorRead>(
+    disk: &mut R,
+    storage_id: u32,
+    block_size: u32,
+    num_blocks: u64,
+    pci_device: u8,
+    pci_function: u8,
+    namespace_id: u32,
+) -> Option<(u32, fs::gpt::Partition)> {
+    use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use r_efi::efi::Status;
+
+    // First, create BlockIO for the raw disk (whole device)
+    let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
+
+    if !disk_block_io.is_null() {
+        if let Some(disk_handle) = boot_services::create_handle() {
+            // Install BlockIO protocol
+            let status = boot_services::install_protocol(
+                disk_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                disk_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for raw NVMe disk on handle {:?}",
+                    disk_handle
+                );
+            }
+
+            // Install DevicePath protocol for the raw disk (NVMe device path)
+            let disk_device_path =
+                device_path::create_nvme_device_path(pci_device, pci_function, namespace_id);
+            if !disk_device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    disk_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    disk_device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed for raw NVMe disk on handle {:?}",
+                        disk_handle
+                    );
+                }
+            }
+        }
+    }
+
+    // Read GPT header and all partitions
+    let header = match fs::gpt::read_gpt_header(disk) {
+        Ok(h) => h,
+        Err(e) => {
+            log::debug!("Failed to read GPT header: {:?}", e);
+            return None;
+        }
+    };
+
+    let partitions = match fs::gpt::read_partitions(disk, &header) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("Failed to read partitions: {:?}", e);
+            return None;
+        }
+    };
+
+    let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
+    let mut candidate_partitions: heapless::Vec<(u32, fs::gpt::Partition), 8> =
+        heapless::Vec::new();
+
+    // Create BlockIO for each partition
+    for (i, partition) in partitions.iter().enumerate() {
+        let partition_num = (i + 1) as u32;
+        let partition_blocks = partition.size_sectors();
+
+        let partition_block_io = block_io::create_partition_block_io(
+            storage_id,
+            partition_num,
+            partition.first_lba,
+            partition_blocks,
+            block_size,
+        );
+
+        if !partition_block_io.is_null() {
+            if let Some(part_handle) = boot_services::create_handle() {
+                // Install BlockIO
+                let status = boot_services::install_protocol(
+                    part_handle,
+                    &BLOCK_IO_PROTOCOL_GUID,
+                    partition_block_io as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "BlockIO protocol installed for NVMe partition {} on handle {:?}",
+                        partition_num,
+                        part_handle
+                    );
+                }
+
+                // Install DevicePath for partition (with full NVMe prefix for proper hierarchy)
+                let device_path = device_path::create_nvme_partition_device_path(
+                    pci_device,
+                    pci_function,
+                    namespace_id,
+                    partition_num,
+                    partition.first_lba,
+                    partition_blocks,
+                    &partition.partition_guid,
+                );
+
+                if !device_path.is_null() {
+                    let status = boot_services::install_protocol(
+                        part_handle,
+                        &DEVICE_PATH_PROTOCOL_GUID,
+                        device_path as *mut core::ffi::c_void,
+                    );
+                    if status == Status::SUCCESS {
+                        log::info!(
+                            "DevicePath protocol installed for NVMe partition {} on handle {:?}",
+                            partition_num,
+                            part_handle
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remember ESP for later (with partition number)
+        if partition.is_esp {
+            log::info!(
+                "Found ESP on NVMe: partition {}, LBA {}-{} ({} MB)",
+                partition_num,
+                partition.first_lba,
+                partition.last_lba,
+                partition.size_bytes() / (1024 * 1024)
+            );
+            esp_partition = Some((partition_num, partition.clone()));
+        } else {
+            // Track as candidate for fallback (small partitions are more likely to be EFI boot)
+            let size_mb = partition.size_bytes() / (1024 * 1024);
+            if size_mb > 0 && size_mb < 512 && partition.first_lba > 0 {
+                let _ = candidate_partitions.push((partition_num, partition.clone()));
+            }
+        }
+    }
+
+    // If we found a proper ESP, return it
+    if esp_partition.is_some() {
+        return esp_partition;
+    }
+
+    // No proper ESP found - try candidate partitions (smaller ones first)
+    for i in 0..candidate_partitions.len() {
+        for j in (i + 1)..candidate_partitions.len() {
+            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
+                let tmp = candidate_partitions[i].clone();
+                candidate_partitions[i] = candidate_partitions[j].clone();
+                candidate_partitions[j] = tmp;
+            }
+        }
+    }
+
+    for (partition_num, partition) in candidate_partitions.iter() {
+        log::debug!(
+            "Trying NVMe partition {} as potential ESP (no proper ESP found)",
+            partition_num
+        );
+        return Some((*partition_num, partition.clone()));
+    }
+
+    None
+}
+
+/// Install BlockIO protocols for an AHCI disk and all its partitions
+///
+/// Returns the ESP partition and its partition number (1-based) if found.
+///
+/// # Arguments
+/// * `disk` - Disk to read GPT from
+/// * `storage_id` - Storage device ID for BlockIO
+/// * `block_size` - Block size in bytes
+/// * `num_blocks` - Total number of blocks
+/// * `pci_device` - PCI device number of the AHCI controller
+/// * `pci_function` - PCI function number
+/// * `port` - AHCI port number
+fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
+    disk: &mut R,
+    storage_id: u32,
+    block_size: u32,
+    num_blocks: u64,
+    pci_device: u8,
+    pci_function: u8,
+    port: u16,
+) -> Option<(u32, fs::gpt::Partition)> {
+    use efi::boot_services;
+    use efi::protocols::block_io::{self, BLOCK_IO_PROTOCOL_GUID};
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use r_efi::efi::Status;
+
+    // First, create BlockIO for the raw disk (whole device)
+    let disk_block_io = block_io::create_disk_block_io(storage_id, num_blocks, block_size);
+
+    if !disk_block_io.is_null() {
+        if let Some(disk_handle) = boot_services::create_handle() {
+            // Install BlockIO protocol
+            let status = boot_services::install_protocol(
+                disk_handle,
+                &BLOCK_IO_PROTOCOL_GUID,
+                disk_block_io as *mut core::ffi::c_void,
+            );
+            if status == Status::SUCCESS {
+                log::info!(
+                    "BlockIO protocol installed for raw AHCI disk on handle {:?}",
+                    disk_handle
+                );
+            }
+
+            // Install DevicePath protocol for the raw disk (SATA device path)
+            let disk_device_path =
+                device_path::create_sata_device_path(pci_device, pci_function, port);
+            if !disk_device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    disk_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    disk_device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed for raw AHCI disk on handle {:?}",
+                        disk_handle
+                    );
+                }
+            }
+        }
+    }
+
+    // Read GPT header and all partitions
+    let header = match fs::gpt::read_gpt_header(disk) {
+        Ok(h) => h,
+        Err(e) => {
+            log::debug!("Failed to read GPT header: {:?}", e);
+            return None;
+        }
+    };
+
+    let partitions = match fs::gpt::read_partitions(disk, &header) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("Failed to read partitions: {:?}", e);
+            return None;
+        }
+    };
+
+    let mut esp_partition: Option<(u32, fs::gpt::Partition)> = None;
+    let mut candidate_partitions: heapless::Vec<(u32, fs::gpt::Partition), 8> =
+        heapless::Vec::new();
+
+    // Create BlockIO for each partition
+    for (i, partition) in partitions.iter().enumerate() {
+        let partition_num = (i + 1) as u32;
+        let partition_blocks = partition.size_sectors();
+
+        let partition_block_io = block_io::create_partition_block_io(
+            storage_id,
+            partition_num,
+            partition.first_lba,
+            partition_blocks,
+            block_size,
+        );
+
+        if !partition_block_io.is_null() {
+            if let Some(part_handle) = boot_services::create_handle() {
+                // Install BlockIO
+                let status = boot_services::install_protocol(
+                    part_handle,
+                    &BLOCK_IO_PROTOCOL_GUID,
+                    partition_block_io as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "BlockIO protocol installed for AHCI partition {} on handle {:?}",
+                        partition_num,
+                        part_handle
+                    );
+                }
+
+                // Install DevicePath for partition (with full SATA prefix for proper hierarchy)
+                let device_path = device_path::create_sata_partition_device_path(
+                    pci_device,
+                    pci_function,
+                    port,
+                    partition_num,
+                    partition.first_lba,
+                    partition_blocks,
+                    &partition.partition_guid,
+                );
+
+                if !device_path.is_null() {
+                    let status = boot_services::install_protocol(
+                        part_handle,
+                        &DEVICE_PATH_PROTOCOL_GUID,
+                        device_path as *mut core::ffi::c_void,
+                    );
+                    if status == Status::SUCCESS {
+                        log::info!(
+                            "DevicePath protocol installed for AHCI partition {} on handle {:?}",
+                            partition_num,
+                            part_handle
+                        );
+                    }
+                }
+            }
+        }
+
+        // Remember ESP for later (with partition number)
+        if partition.is_esp {
+            log::info!(
+                "Found ESP on AHCI: partition {}, LBA {}-{} ({} MB)",
+                partition_num,
+                partition.first_lba,
+                partition.last_lba,
+                partition.size_bytes() / (1024 * 1024)
+            );
+            esp_partition = Some((partition_num, partition.clone()));
+        } else {
+            // Track as candidate for fallback (small partitions are more likely to be EFI boot)
+            let size_mb = partition.size_bytes() / (1024 * 1024);
+            if size_mb > 0 && size_mb < 512 && partition.first_lba > 0 {
+                let _ = candidate_partitions.push((partition_num, partition.clone()));
+            }
+        }
+    }
+
+    // If we found a proper ESP, return it
+    if esp_partition.is_some() {
+        return esp_partition;
+    }
+
+    // No proper ESP found - try candidate partitions (smaller ones first)
+    for i in 0..candidate_partitions.len() {
+        for j in (i + 1)..candidate_partitions.len() {
+            if candidate_partitions[j].1.size_bytes() < candidate_partitions[i].1.size_bytes() {
+                let tmp = candidate_partitions[i].clone();
+                candidate_partitions[i] = candidate_partitions[j].clone();
+                candidate_partitions[j] = tmp;
+            }
+        }
+    }
+
+    for (partition_num, partition) in candidate_partitions.iter() {
+        log::debug!(
+            "Trying AHCI partition {} as potential ESP (no proper ESP found)",
+            partition_num
+        );
         return Some((*partition_num, partition.clone()));
     }
 
@@ -827,6 +1242,120 @@ fn try_boot_from_esp_nvme(
     false
 }
 
+/// Try to boot from an ESP on AHCI (with SimpleFileSystem support)
+///
+/// # Arguments
+/// * `disk` - AHCI disk to read from
+/// * `esp` - ESP partition info
+/// * `partition_num` - 1-based partition number of the ESP
+/// * `pci_device` - PCI device number of AHCI controller
+/// * `pci_function` - PCI function number
+/// * `port` - AHCI port number
+fn try_boot_from_esp_ahci(
+    disk: &mut fs::gpt::AhciDisk,
+    esp: &fs::gpt::Partition,
+    partition_num: u32,
+    pci_device: u8,
+    pci_function: u8,
+    port: u16,
+) -> bool {
+    use efi::boot_services;
+    use efi::protocols::device_path::{self, DEVICE_PATH_PROTOCOL_GUID};
+    use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
+    use r_efi::efi::Status;
+
+    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+        Ok(mut fat) => {
+            log::info!("FAT filesystem mounted on ESP");
+
+            // Extract filesystem state for the SimpleFileSystem protocol
+            let fs_state = extract_fat_state_ahci(esp.first_lba);
+
+            // Initialize SimpleFileSystem protocol with AHCI read function
+            let sfs_protocol =
+                simple_file_system::init(fs_state, drivers::ahci::global_read_sector);
+
+            // Create a device handle with SimpleFileSystem and DevicePath protocols
+            let device_handle = match boot_services::create_handle() {
+                Some(h) => h,
+                None => {
+                    log::error!("Failed to create device handle");
+                    return false;
+                }
+            };
+
+            // Install DevicePath protocol on the device handle
+            // Use full SATA partition path for proper hierarchy matching
+            let partition_size = esp.size_sectors();
+            let device_path = device_path::create_sata_partition_device_path(
+                pci_device,
+                pci_function,
+                port,
+                partition_num,
+                esp.first_lba,
+                partition_size,
+                &esp.partition_guid,
+            );
+
+            if !device_path.is_null() {
+                let status = boot_services::install_protocol(
+                    device_handle,
+                    &DEVICE_PATH_PROTOCOL_GUID,
+                    device_path as *mut core::ffi::c_void,
+                );
+                if status == Status::SUCCESS {
+                    log::info!(
+                        "DevicePath protocol installed on device handle {:?}",
+                        device_handle
+                    );
+                } else {
+                    log::warn!("Failed to install DevicePath protocol: {:?}", status);
+                }
+            }
+
+            // Install SimpleFileSystem protocol on the device handle
+            let status = boot_services::install_protocol(
+                device_handle,
+                &SIMPLE_FILE_SYSTEM_GUID,
+                sfs_protocol as *mut core::ffi::c_void,
+            );
+
+            if status != Status::SUCCESS {
+                log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
+                return false;
+            }
+
+            log::info!(
+                "SimpleFileSystem protocol installed on device handle {:?}",
+                device_handle
+            );
+
+            // Look for EFI bootloader
+            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            match fat.file_size(boot_path) {
+                Ok(size) => {
+                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
+
+                    // Load and execute the bootloader with device handle
+                    match load_and_execute_bootloader(&mut fat, boot_path, size, device_handle) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            log::error!("Failed to execute bootloader: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Bootloader not found: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        }
+    }
+    false
+}
+
 /// Extract FAT filesystem state for the SimpleFileSystem protocol (USB version)
 fn extract_fat_state<R: fs::gpt::SectorRead>(
     _fat: &fs::fat::FatFilesystem<R>,
@@ -845,6 +1374,23 @@ fn extract_fat_state<R: fs::gpt::SectorRead>(
     let mut buffer = [0u8; SECTOR_SIZE];
     if let Err(_) = drivers::usb::mass_storage::global_read_sector(partition_start, &mut buffer) {
         log::error!("Failed to read boot sector for filesystem state");
+        return FilesystemState::empty();
+    }
+
+    parse_fat_bpb(&buffer, partition_start)
+}
+
+/// Extract FAT filesystem state for AHCI devices
+fn extract_fat_state_ahci(
+    partition_start: u64,
+) -> efi::protocols::simple_file_system::FilesystemState {
+    use efi::protocols::simple_file_system::FilesystemState;
+    use fs::fat::SECTOR_SIZE;
+
+    // Read boot sector directly using AHCI global read
+    let mut buffer = [0u8; SECTOR_SIZE];
+    if let Err(_) = drivers::ahci::global_read_sector(partition_start, &mut buffer) {
+        log::error!("Failed to read boot sector for AHCI filesystem state");
         return FilesystemState::empty();
     }
 

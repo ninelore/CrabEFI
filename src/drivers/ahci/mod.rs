@@ -181,8 +181,24 @@ mod ata_cmd {
     pub const WRITE_DMA_EXT: u8 = 0x35;
     /// Identify Device
     pub const IDENTIFY: u8 = 0xEC;
+    /// Identify Packet Device (ATAPI)
+    pub const IDENTIFY_PACKET: u8 = 0xA1;
+    /// ATAPI Packet Command
+    pub const PACKET: u8 = 0xA0;
     /// Set Features
     pub const SET_FEATURES: u8 = 0xEF;
+}
+
+/// SCSI Commands (used with ATAPI PACKET command)
+mod scsi_cmd {
+    /// Read (10) - read sectors
+    pub const READ_10: u8 = 0x28;
+    /// Read (12) - read sectors (extended)
+    pub const READ_12: u8 = 0xA8;
+    /// Read Capacity (10) - get disk size
+    pub const READ_CAPACITY_10: u8 = 0x25;
+    /// Test Unit Ready
+    pub const TEST_UNIT_READY: u8 = 0x00;
 }
 
 /// Command Header (32 bytes)
@@ -416,6 +432,8 @@ pub enum DeviceType {
 
 /// AHCI Controller
 pub struct AhciController {
+    /// PCI address (bus:device.function)
+    pci_address: pci::PciAddress,
     /// MMIO base address
     mmio_base: u64,
     /// Number of command slots
@@ -494,6 +512,7 @@ impl AhciController {
         }
 
         let mut controller = Self {
+            pci_address: pci_dev.address,
             mmio_base,
             num_cmd_slots,
             num_ports,
@@ -564,6 +583,14 @@ impl AhciController {
                             port.sector_count
                         );
                         let _ = self.ports.push(port);
+                    } else if port.device_type == DeviceType::Satapi {
+                        log::info!(
+                            "AHCI Port {}: SATAPI device, {} sectors (sector_size={})",
+                            port_num,
+                            port.sector_count,
+                            port.sector_size
+                        );
+                        let _ = self.ports.push(port);
                     } else {
                         log::info!("AHCI Port {}: {:?} device", port_num, port.device_type);
                     }
@@ -574,7 +601,7 @@ impl AhciController {
             }
         }
 
-        log::info!("AHCI: {} SATA ports initialized", self.ports.len());
+        log::info!("AHCI: {} ports initialized", self.ports.len());
         Ok(())
     }
 
@@ -669,10 +696,14 @@ impl AhciController {
             sector_size: 512,
         };
 
-        // Identify the device if it might be a SATA drive
+        // Identify the device
         if device_type == DeviceType::Sata {
             if let Err(e) = self.identify_device(&mut port) {
                 log::warn!("AHCI Port {}: IDENTIFY failed: {:?}", port_num, e);
+            }
+        } else if device_type == DeviceType::Satapi {
+            if let Err(e) = self.identify_device_atapi(&mut port) {
+                log::warn!("AHCI Port {}: IDENTIFY PACKET failed: {:?}", port_num, e);
             }
         }
 
@@ -862,7 +893,135 @@ impl AhciController {
         Ok(())
     }
 
-    /// Read sectors from a port
+    /// Identify a SATAPI device (CD/DVD)
+    fn identify_device_atapi(&mut self, port: &mut AhciPort) -> Result<(), AhciError> {
+        let slot = self
+            .find_free_slot(port.port_num)
+            .ok_or(AhciError::PortNotReady)?;
+
+        // Allocate buffer for identify data (512 bytes)
+        let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        unsafe { ptr::write_bytes(buffer as *mut u8, 0, 4096) };
+
+        // Setup command header (set ATAPI bit)
+        let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5); // 5 DWORDs for H2D FIS
+        header.set_write(false);
+        header.set_prdtl(1);
+        // Set ATAPI bit (bit 5 of DW0)
+        header.dw0 |= 1 << 5;
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *port.cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for IDENTIFY PACKET DEVICE
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ata_cmd::IDENTIFY_PACKET);
+
+        // Setup PRDT
+        table.prdt[0].set_address(buffer);
+        table.prdt[0].set_byte_count(512, true);
+
+        // Issue command
+        self.issue_command(port, slot)?;
+
+        // Parse identify packet data
+        let identify = unsafe { core::slice::from_raw_parts(buffer as *const u16, 256) };
+
+        // Get model number (words 27-46)
+        let mut model = [0u8; 40];
+        for i in 0..20 {
+            let word = identify[27 + i];
+            model[i * 2] = (word >> 8) as u8;
+            model[i * 2 + 1] = (word & 0xFF) as u8;
+        }
+        let model_str = core::str::from_utf8(&model).unwrap_or("Unknown").trim();
+
+        log::info!("AHCI Port {}: ATAPI device: {}", port.port_num, model_str);
+
+        efi::free_pages(buffer, 1);
+
+        // Now get the capacity using READ CAPACITY
+        self.read_capacity_atapi(port)?;
+
+        Ok(())
+    }
+
+    /// Read capacity from ATAPI device using SCSI READ CAPACITY(10)
+    fn read_capacity_atapi(&mut self, port: &mut AhciPort) -> Result<(), AhciError> {
+        let slot = self
+            .find_free_slot(port.port_num)
+            .ok_or(AhciError::PortNotReady)?;
+
+        // Allocate buffer for capacity data (8 bytes)
+        let buffer = efi::allocate_pages(1).ok_or(AhciError::AllocationFailed)?;
+        unsafe { ptr::write_bytes(buffer as *mut u8, 0, 4096) };
+
+        // Setup command header (set ATAPI bit)
+        let header = unsafe { &mut *port.cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5); // 5 DWORDs for H2D FIS
+        header.set_write(false);
+        header.set_prdtl(1);
+        // Set ATAPI bit (bit 5 of DW0)
+        header.dw0 |= 1 << 5;
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *port.cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for ATAPI PACKET command
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ata_cmd::PACKET);
+        fis.feature_l = 0; // DMA=0, OVL=0
+        fis.lba1 = 8; // Byte count low (8 bytes response)
+        fis.lba2 = 0; // Byte count high
+
+        // Setup ATAPI command (SCSI READ CAPACITY(10)) in ACMD area
+        table.acmd[0] = scsi_cmd::READ_CAPACITY_10;
+        // Rest of the CDB is zeros for READ CAPACITY
+
+        // Setup PRDT
+        table.prdt[0].set_address(buffer);
+        table.prdt[0].set_byte_count(8, true);
+
+        // Issue command
+        if let Err(e) = self.issue_command(port, slot) {
+            log::warn!("READ CAPACITY failed: {:?}, using defaults", e);
+            // Use default values for CD/DVD
+            port.sector_size = 2048;
+            port.sector_count = 0;
+            efi::free_pages(buffer, 1);
+            return Ok(());
+        }
+
+        // Parse capacity data (big-endian)
+        let data = unsafe { core::slice::from_raw_parts(buffer as *const u8, 8) };
+        let last_lba = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let block_size = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
+        port.sector_count = (last_lba as u64) + 1;
+        port.sector_size = block_size;
+
+        log::info!(
+            "AHCI Port {}: ATAPI capacity: {} sectors x {} bytes = {} MB",
+            port.port_num,
+            port.sector_count,
+            port.sector_size,
+            (port.sector_count * port.sector_size as u64) / (1024 * 1024)
+        );
+
+        efi::free_pages(buffer, 1);
+        Ok(())
+    }
+
+    /// Read sectors from a port (dispatches to SATA or ATAPI based on device type)
     pub fn read_sectors(
         &mut self,
         port_index: usize,
@@ -874,6 +1033,25 @@ impl AhciController {
             return Err(AhciError::InvalidParameter);
         }
 
+        // Check device type
+        let device_type = self.ports[port_index].device_type;
+        let sector_size = self.ports[port_index].sector_size;
+
+        if device_type == DeviceType::Satapi {
+            self.read_sectors_atapi(port_index, start_lba, num_sectors, buffer, sector_size)
+        } else {
+            self.read_sectors_sata(port_index, start_lba, num_sectors, buffer)
+        }
+    }
+
+    /// Read sectors from a SATA device using READ DMA EXT
+    fn read_sectors_sata(
+        &mut self,
+        port_index: usize,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *mut u8,
+    ) -> Result<(), AhciError> {
         // Extract needed values from port before mutable operations
         let port_num = self.ports[port_index].port_num;
         let cmd_list = self.ports[port_index].cmd_list;
@@ -913,6 +1091,87 @@ impl AhciController {
         Ok(())
     }
 
+    /// Read sectors from a SATAPI device using ATAPI PACKET with SCSI READ(10)
+    fn read_sectors_atapi(
+        &mut self,
+        port_index: usize,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: *mut u8,
+        sector_size: u32,
+    ) -> Result<(), AhciError> {
+        // Extract needed values from port before mutable operations
+        let port_num = self.ports[port_index].port_num;
+        let cmd_list = self.ports[port_index].cmd_list;
+        let cmd_tables = self.ports[port_index].cmd_tables;
+
+        let slot = self
+            .find_free_slot(port_num)
+            .ok_or(AhciError::PortNotReady)?;
+
+        // Setup command header (set ATAPI bit)
+        let header = unsafe { &mut *cmd_list.add(slot as usize) };
+        header.dw0 = 0;
+        header.set_cfl(5); // 5 DWORDs for H2D FIS
+        header.set_write(false);
+        header.set_prdtl(1);
+        // Set ATAPI bit (bit 5 of DW0)
+        header.dw0 |= 1 << 5;
+        header.prdbc = 0;
+
+        // Setup command table
+        let table = unsafe { &mut *cmd_tables[slot as usize] };
+        *table = CommandTable::default();
+
+        // Setup FIS for ATAPI PACKET command
+        let fis = unsafe { &mut *(table.cfis.as_mut_ptr() as *mut FisRegH2D) };
+        *fis = FisRegH2D::new();
+        fis.set_command(ata_cmd::PACKET);
+        fis.feature_l = 0; // PIO mode (DMA=0)
+
+        let byte_count = num_sectors * sector_size;
+        fis.lba1 = (byte_count & 0xFF) as u8; // Byte count low
+        fis.lba2 = ((byte_count >> 8) & 0xFF) as u8; // Byte count high
+
+        // Setup ATAPI command (SCSI READ(10)) in ACMD area
+        // CDB format for READ(10):
+        // Byte 0: Operation code (0x28)
+        // Byte 1: Flags (0)
+        // Bytes 2-5: LBA (big-endian)
+        // Byte 6: Group number (0)
+        // Bytes 7-8: Transfer length in sectors (big-endian)
+        // Byte 9: Control (0)
+        table.acmd[0] = scsi_cmd::READ_10;
+        table.acmd[1] = 0;
+        table.acmd[2] = ((start_lba >> 24) & 0xFF) as u8;
+        table.acmd[3] = ((start_lba >> 16) & 0xFF) as u8;
+        table.acmd[4] = ((start_lba >> 8) & 0xFF) as u8;
+        table.acmd[5] = (start_lba & 0xFF) as u8;
+        table.acmd[6] = 0;
+        table.acmd[7] = ((num_sectors >> 8) & 0xFF) as u8;
+        table.acmd[8] = (num_sectors & 0xFF) as u8;
+        table.acmd[9] = 0;
+
+        // Setup PRDT
+        table.prdt[0].set_address(buffer as u64);
+        table.prdt[0].set_byte_count(byte_count, true);
+
+        log::debug!(
+            "read_sectors_atapi: LBA={}, count={}, byte_count={}, buffer={:p}",
+            start_lba,
+            num_sectors,
+            byte_count,
+            buffer
+        );
+
+        // Issue command - pass port_num instead of port reference
+        self.issue_command_by_port(port_num, slot)?;
+
+        log::debug!("read_sectors_atapi: command completed successfully");
+
+        Ok(())
+    }
+
     /// Issue a command by port number and wait for completion
     fn issue_command_by_port(&mut self, port_num: u8, slot: u8) -> Result<(), AhciError> {
         fence(Ordering::SeqCst);
@@ -921,7 +1180,7 @@ impl AhciController {
         self.write_port_reg(port_num, port_regs::CI, 1 << slot);
 
         // Wait for completion
-        for _ in 0..10000000 {
+        for i in 0..10000000u32 {
             let ci = self.read_port_reg(port_num, port_regs::CI);
             if ci & (1 << slot) == 0 {
                 // Check for errors
@@ -930,6 +1189,11 @@ impl AhciController {
                     log::error!("AHCI command error: TFD={:#x}", tfd);
                     return Err(AhciError::CommandFailed);
                 }
+                log::trace!(
+                    "issue_command_by_port: completed after {} iterations, TFD={:#x}",
+                    i,
+                    tfd
+                );
                 return Ok(());
             }
 
@@ -938,11 +1202,12 @@ impl AhciController {
             if is & (1 << 30) != 0 {
                 // Task File Error
                 let tfd = self.read_port_reg(port_num, port_regs::TFD);
-                log::error!("AHCI task file error: TFD={:#x}", tfd);
+                log::error!("AHCI task file error: TFD={:#x}, IS={:#x}", tfd, is);
                 return Err(AhciError::CommandFailed);
             }
         }
 
+        log::error!("AHCI command timeout on port {}", port_num);
         Err(AhciError::Timeout)
     }
 
@@ -954,6 +1219,11 @@ impl AhciController {
     /// Get port info
     pub fn get_port(&self, index: usize) -> Option<&AhciPort> {
         self.ports.get(index)
+    }
+
+    /// Get the PCI address of this controller
+    pub fn pci_address(&self) -> pci::PciAddress {
+        self.pci_address
     }
 }
 
@@ -1027,3 +1297,173 @@ pub fn get_controller(index: usize) -> Option<&'static mut AhciController> {
 // Ensure AhciController can be sent between threads
 unsafe impl Send for AhciController {}
 unsafe impl Send for AhciPort {}
+
+// ============================================================================
+// Global AHCI Device for SimpleFileSystem Protocol
+// ============================================================================
+
+/// Global AHCI device info for filesystem reads
+struct GlobalAhciDevice {
+    controller_index: usize,
+    port_index: usize,
+}
+
+/// Pointer wrapper for global storage
+struct GlobalAhciDevicePtr(*mut GlobalAhciDevice);
+
+// Safety: We use mutex protection for all access
+unsafe impl Send for GlobalAhciDevicePtr {}
+
+/// Global AHCI device for filesystem protocol
+static GLOBAL_AHCI_DEVICE: Mutex<Option<GlobalAhciDevicePtr>> = Mutex::new(None);
+
+/// Store AHCI device info globally for SimpleFileSystem protocol
+///
+/// # Arguments
+/// * `controller_index` - Index of the AHCI controller
+/// * `port_index` - Port index to use for reads
+///
+/// # Returns
+/// `true` if the device was stored successfully
+pub fn store_global_device(controller_index: usize, port_index: usize) -> bool {
+    // Allocate memory for the device info
+    let size = core::mem::size_of::<GlobalAhciDevice>();
+    let pages = (size + 4095) / 4096;
+
+    if let Some(ptr) = efi::allocate_pages(pages as u64) {
+        let device_ptr = ptr as *mut GlobalAhciDevice;
+        unsafe {
+            core::ptr::write(
+                device_ptr,
+                GlobalAhciDevice {
+                    controller_index,
+                    port_index,
+                },
+            );
+        }
+
+        *GLOBAL_AHCI_DEVICE.lock() = Some(GlobalAhciDevicePtr(device_ptr));
+        log::info!(
+            "AHCI device stored globally (controller={}, port={})",
+            controller_index,
+            port_index
+        );
+        true
+    } else {
+        log::error!("Failed to allocate memory for global AHCI device");
+        false
+    }
+}
+
+/// Read a sector from the global AHCI device
+///
+/// This function is used as the read callback for the SimpleFileSystem protocol.
+/// For SATAPI devices (CD/DVD), this handles sector size translation from
+/// 512-byte sectors (expected by FAT/GPT code) to 2048-byte CD sectors.
+pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
+    // Get the device info
+    let (controller_index, port_index) = match GLOBAL_AHCI_DEVICE.lock().as_ref() {
+        Some(ptr) => unsafe {
+            let device = &*ptr.0;
+            (device.controller_index, device.port_index)
+        },
+        None => {
+            log::error!("global_read_sector: no AHCI device stored");
+            return Err(());
+        }
+    };
+
+    // Get the controller
+    let controller = match get_controller(controller_index) {
+        Some(c) => c,
+        None => {
+            log::error!(
+                "global_read_sector: no AHCI controller at index {}",
+                controller_index
+            );
+            return Err(());
+        }
+    };
+
+    // Check device type and sector size
+    let (device_type, sector_size) = match controller.get_port(port_index) {
+        Some(port) => (port.device_type, port.sector_size),
+        None => {
+            log::error!("global_read_sector: no port at index {}", port_index);
+            return Err(());
+        }
+    };
+
+    // For SATAPI devices with 2048-byte sectors, translate 512-byte LBA
+    if device_type == DeviceType::Satapi && sector_size == 2048 {
+        // Calculate actual CD sector and offset within it
+        // Caller expects 512-byte sectors, CD uses 2048-byte sectors
+        let cd_lba = lba / 4;
+        let offset_in_sector = ((lba % 4) * 512) as usize;
+
+        log::debug!(
+            "global_read_sector: SATAPI translate LBA {} -> CD LBA {}, offset {}",
+            lba,
+            cd_lba,
+            offset_in_sector
+        );
+
+        // Allocate a temporary buffer for the full CD sector
+        let cd_buffer = match efi::allocate_pages(1) {
+            Some(ptr) => ptr as *mut u8,
+            None => {
+                log::error!("global_read_sector: failed to allocate CD buffer");
+                return Err(());
+            }
+        };
+
+        // Clear the buffer first
+        unsafe { core::ptr::write_bytes(cd_buffer, 0xAA, 2048) };
+
+        // Read the CD sector
+        let result = controller.read_sectors(port_index, cd_lba, 1, cd_buffer);
+
+        if result.is_ok() {
+            // Log first few bytes of the CD sector for debugging
+            let data = unsafe { core::slice::from_raw_parts(cd_buffer, 32) };
+            log::debug!(
+                "global_read_sector: CD sector 0 first 32 bytes: {:02x?}",
+                data
+            );
+
+            // Copy the relevant 512 bytes to the caller's buffer
+            let src = unsafe { core::slice::from_raw_parts(cd_buffer.add(offset_in_sector), 512) };
+            let copy_len = core::cmp::min(buffer.len(), 512);
+            buffer[..copy_len].copy_from_slice(&src[..copy_len]);
+
+            // Log first few bytes of what we're returning
+            log::debug!(
+                "global_read_sector: returning bytes at offset {}: {:02x?}",
+                offset_in_sector,
+                &buffer[..core::cmp::min(32, buffer.len())]
+            );
+        }
+
+        efi::free_pages(cd_buffer as u64, 1);
+
+        result.map_err(|e| {
+            log::error!(
+                "global_read_sector: AHCI ATAPI read failed at CD LBA {} (512-byte LBA {}): {:?}",
+                cd_lba,
+                lba,
+                e
+            );
+        })
+    } else {
+        // Direct read for SATA devices with 512-byte sectors
+        controller
+            .read_sectors(port_index, lba, 1, buffer.as_mut_ptr())
+            .map_err(|e| {
+                log::error!(
+                    "global_read_sector: AHCI read failed at LBA {}: {:?}",
+                    lba,
+                    e
+                );
+            })
+    }
+}

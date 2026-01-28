@@ -115,19 +115,11 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
             }
         }
         StorageType::Ahci {
-            controller_id,
-            port,
+            controller_id: _,
+            port: _,
         } => {
-            if let Some(controller) = crate::drivers::ahci::get_controller(controller_id) {
-                controller
-                    .read_sectors(port, lba, 1, buffer.as_mut_ptr())
-                    .map_err(|e| {
-                        log::error!("AHCI read failed at LBA {}: {:?}", lba, e);
-                    })
-            } else {
-                log::error!("AHCI controller {} not found", controller_id);
-                Err(())
-            }
+            // Use global_read_sector which handles sector size translation for SATAPI
+            crate::drivers::ahci::global_read_sector(lba, buffer)
         }
     }
 }

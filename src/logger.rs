@@ -36,6 +36,7 @@ static LOGGER: SerialLogger = SerialLogger;
 pub fn init() {
     log::set_logger(&LOGGER)
         .map(|()| log::set_max_level(LevelFilter::Debug))
+        // .map(|()| log::set_max_level(LevelFilter::Info))
         .expect("Failed to set logger");
 }
 

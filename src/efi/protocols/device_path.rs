@@ -552,6 +552,198 @@ pub fn create_nvme_partition_device_path(
 }
 
 // ============================================================================
+// SATA (AHCI) Device Paths
+// ============================================================================
+
+/// SATA Device Path Node (UEFI Spec 10.3.4.6)
+#[repr(C, packed)]
+pub struct SataDevicePathNode {
+    pub r#type: u8,
+    pub sub_type: u8,
+    pub length: [u8; 2],
+    /// HBA Port Number
+    pub hba_port: u16,
+    /// Port Multiplier Port Number (0xFFFF if no port multiplier)
+    pub port_multiplier_port: u16,
+    /// Logical Unit Number
+    pub lun: u16,
+}
+
+/// Sub-type for SATA device path
+const SUBTYPE_SATA: u8 = 0x12;
+
+/// Full SATA device path: ACPI + PCI + SATA + End
+#[repr(C, packed)]
+pub struct FullSataDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub sata: SataDevicePathNode,
+    pub end: End,
+}
+
+/// Full SATA partition device path: ACPI + PCI + SATA + HardDrive + End
+#[repr(C, packed)]
+pub struct FullSataPartitionDevicePath {
+    pub acpi: AcpiDevicePathNode,
+    pub pci: PciDevicePathNode,
+    pub sata: SataDevicePathNode,
+    pub hard_drive: HardDriveMedia,
+    pub end: End,
+}
+
+/// Create a device path for a SATA device (whole disk)
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/SATA(port,0xFFFF,0)/End
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the AHCI controller
+/// * `pci_function` - PCI function number
+/// * `port` - AHCI port number
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_sata_device_path(pci_device: u8, pci_function: u8, port: u16) -> *mut Protocol {
+    let size = core::mem::size_of::<FullSataDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullSataDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate SATA device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for AHCI controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // SATA node
+        (*ptr).sata.r#type = TYPE_MESSAGING;
+        (*ptr).sata.sub_type = SUBTYPE_SATA;
+        (*ptr).sata.length = (core::mem::size_of::<SataDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).sata.hba_port = port;
+        (*ptr).sata.port_multiplier_port = 0xFFFF; // No port multiplier
+        (*ptr).sata.lun = 0;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created SATA device path: ACPI/PCI({:02x},{:x})/SATA({})",
+        pci_device,
+        pci_function,
+        port
+    );
+
+    ptr as *mut Protocol
+}
+
+/// Create a device path for a partition on a SATA device
+///
+/// Creates a device path: ACPI(PNP0A03,0)/PCI(dev,func)/SATA(port,0xFFFF,0)/HD(part,...)/End
+///
+/// # Arguments
+/// * `pci_device` - PCI device number of the AHCI controller
+/// * `pci_function` - PCI function number
+/// * `port` - AHCI port number
+/// * `partition_number` - The partition number (1-based)
+/// * `partition_start` - Start LBA of the partition
+/// * `partition_size` - Size of the partition in sectors
+/// * `partition_guid` - The GPT partition GUID (unique identifier)
+///
+/// # Returns
+/// A pointer to the device path protocol, or null on failure
+pub fn create_sata_partition_device_path(
+    pci_device: u8,
+    pci_function: u8,
+    port: u16,
+    partition_number: u32,
+    partition_start: u64,
+    partition_size: u64,
+    partition_guid: &[u8; 16],
+) -> *mut Protocol {
+    let size = core::mem::size_of::<FullSataPartitionDevicePath>();
+
+    let ptr = match allocate_pool(MemoryType::BootServicesData, size) {
+        Ok(p) => p as *mut FullSataPartitionDevicePath,
+        Err(_) => {
+            log::error!("Failed to allocate SATA partition device path");
+            return core::ptr::null_mut();
+        }
+    };
+
+    unsafe {
+        // ACPI node for PCI root bridge
+        (*ptr).acpi.r#type = TYPE_ACPI;
+        (*ptr).acpi.sub_type = SUBTYPE_ACPI;
+        (*ptr).acpi.length = (core::mem::size_of::<AcpiDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).acpi.hid = EISA_PNP_ID_PCI_ROOT;
+        (*ptr).acpi.uid = 0;
+
+        // PCI node for AHCI controller
+        (*ptr).pci.r#type = TYPE_HARDWARE;
+        (*ptr).pci.sub_type = SUBTYPE_PCI;
+        (*ptr).pci.length = (core::mem::size_of::<PciDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).pci.function = pci_function;
+        (*ptr).pci.device = pci_device;
+
+        // SATA node
+        (*ptr).sata.r#type = TYPE_MESSAGING;
+        (*ptr).sata.sub_type = SUBTYPE_SATA;
+        (*ptr).sata.length = (core::mem::size_of::<SataDevicePathNode>() as u16).to_le_bytes();
+        (*ptr).sata.hba_port = port;
+        (*ptr).sata.port_multiplier_port = 0xFFFF; // No port multiplier
+        (*ptr).sata.lun = 0;
+
+        // HardDrive node for partition
+        (*ptr).hard_drive.header.r#type = TYPE_MEDIA;
+        (*ptr).hard_drive.header.sub_type = Media::SUBTYPE_HARDDRIVE;
+        (*ptr).hard_drive.header.length =
+            (core::mem::size_of::<HardDriveMedia>() as u16).to_le_bytes();
+        (*ptr).hard_drive.partition_number = partition_number;
+        (*ptr).hard_drive.partition_start = partition_start;
+        (*ptr).hard_drive.partition_size = partition_size;
+        (*ptr)
+            .hard_drive
+            .partition_signature
+            .copy_from_slice(partition_guid);
+        (*ptr).hard_drive.partition_format = PARTITION_FORMAT_GPT;
+        (*ptr).hard_drive.signature_type = SIGNATURE_TYPE_GUID;
+
+        // End node
+        (*ptr).end.header.r#type = TYPE_END;
+        (*ptr).end.header.sub_type = End::SUBTYPE_ENTIRE;
+        (*ptr).end.header.length = (core::mem::size_of::<End>() as u16).to_le_bytes();
+    }
+
+    log::debug!(
+        "Created SATA partition device path: ACPI/PCI({:02x},{:x})/SATA({})/HD({},{},{})",
+        pci_device,
+        pci_function,
+        port,
+        partition_number,
+        partition_start,
+        partition_size
+    );
+
+    ptr as *mut Protocol
+}
+
+// ============================================================================
 // File Path Device Paths
 // ============================================================================
 
