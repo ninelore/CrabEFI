@@ -34,8 +34,8 @@ use crate::efi;
 use spin::Mutex;
 
 // Re-import from standard library (use :: prefix to avoid conflict with our core module)
-use ::core::mem;
-use ::core::ptr;
+use core::mem;
+use core::ptr;
 
 // ============================================================================
 // Controller Type Abstraction
@@ -248,6 +248,43 @@ fn init_keyboards() {
             }
         }
     }
+}
+
+/// Clean up all USB controllers before ExitBootServices
+///
+/// This must be called before handing off to the OS to ensure Linux's
+/// USB drivers can properly initialize the controllers. Following
+/// libpayload's shutdown patterns for each controller type.
+pub fn cleanup() {
+    log::info!("USB cleanup: stopping all controllers for OS handoff");
+
+    let mut controllers = ALL_CONTROLLERS.lock();
+
+    for handle in controllers.iter_mut() {
+        match handle {
+            UsbControllerHandle::Xhci(ptr) => {
+                let controller = unsafe { &mut **ptr };
+                controller.cleanup();
+            }
+            UsbControllerHandle::Ehci(ptr) => {
+                let controller = unsafe { &mut **ptr };
+                controller.cleanup();
+            }
+            UsbControllerHandle::Ohci(ptr) => {
+                let controller = unsafe { &mut **ptr };
+                controller.cleanup();
+            }
+            UsbControllerHandle::Uhci(ptr) => {
+                let controller = unsafe { &mut **ptr };
+                controller.cleanup();
+            }
+        }
+    }
+
+    // Also clean up any xHCI controllers from the legacy init path
+    xhci::cleanup();
+
+    log::info!("USB cleanup complete");
 }
 
 /// Get the number of controllers
