@@ -38,6 +38,9 @@ pub fn init(cb_info: &CorebootInfo) {
     // Create console handles and install protocols
     init_console();
 
+    // Install Unicode Collation protocol
+    init_unicode_collation();
+
     log::info!("EFI environment initialized");
 }
 
@@ -87,6 +90,45 @@ fn init_console() {
     }
 
     log::debug!("Console protocols installed");
+}
+
+/// Initialize Unicode Collation protocol
+fn init_unicode_collation() {
+    use protocols::unicode_collation::{
+        get_protocol_void, UNICODE_COLLATION_PROTOCOL2_GUID, UNICODE_COLLATION_PROTOCOL_GUID,
+    };
+
+    // Create a handle for Unicode Collation
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create Unicode Collation handle");
+            return;
+        }
+    };
+
+    // Install version 1 (legacy) protocol
+    let protocol = get_protocol_void();
+    let status =
+        boot_services::install_protocol(handle, &UNICODE_COLLATION_PROTOCOL_GUID, protocol);
+    if status != Status::SUCCESS {
+        log::error!(
+            "Failed to install Unicode Collation v1 protocol: {:?}",
+            status
+        );
+    }
+
+    // Install version 2 protocol
+    let status =
+        boot_services::install_protocol(handle, &UNICODE_COLLATION_PROTOCOL2_GUID, protocol);
+    if status != Status::SUCCESS {
+        log::error!(
+            "Failed to install Unicode Collation v2 protocol: {:?}",
+            status
+        );
+    }
+
+    log::debug!("Unicode Collation protocols installed");
 }
 
 /// Get the EFI system table pointer

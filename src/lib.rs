@@ -123,65 +123,340 @@ fn init_storage() {
     drivers::pci::init();
     drivers::pci::print_devices();
 
-    // Initialize NVMe controllers
+    // Initialize all storage controllers
     drivers::nvme::init();
+    drivers::ahci::init();
+    drivers::usb::init_all();
 
-    // Try to find ESP on NVMe
+    // Try to find ESP on NVMe first
+    if try_boot_from_nvme() {
+        return;
+    }
+
+    // Try AHCI/SATA
+    if try_boot_from_ahci() {
+        return;
+    }
+
+    // Try USB mass storage
+    if try_boot_from_usb() {
+        return;
+    }
+
+    log::warn!("No bootable media found!");
+    log::info!("Storage initialization complete");
+}
+
+/// Try to boot from NVMe
+fn try_boot_from_nvme() -> bool {
     if let Some(controller) = drivers::nvme::get_controller(0) {
         log::info!("Probing NVMe controller for ESP...");
 
         match fs::gpt::find_esp_on_nvme(controller) {
             Ok(esp) => {
                 log::info!(
-                    "Found ESP: LBA {}-{} ({} MB)",
+                    "Found ESP on NVMe: LBA {}-{} ({} MB)",
                     esp.first_lba,
                     esp.last_lba,
                     esp.size_bytes() / (1024 * 1024)
                 );
 
-                // Try to read FAT filesystem and find bootloader
                 if let Some(ns) = controller.default_namespace() {
                     let nsid = ns.nsid;
                     let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
 
-                    match fs::fat::FatFilesystem::new(&mut disk, esp.first_lba) {
-                        Ok(mut fat) => {
-                            log::info!("FAT filesystem mounted on ESP");
-
-                            // Look for EFI bootloader
-                            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
-                            match fat.file_size(boot_path) {
-                                Ok(size) => {
-                                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
-
-                                    // Load and execute the bootloader
-                                    if let Err(e) =
-                                        load_and_execute_bootloader(&mut fat, boot_path, size)
-                                    {
-                                        log::error!("Failed to execute bootloader: {:?}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("Bootloader not found: {:?}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Failed to mount FAT filesystem: {:?}", e);
-                        }
+                    if try_boot_from_esp(&mut disk, &esp) {
+                        return true;
                     }
                 }
             }
             Err(e) => {
-                log::warn!("No ESP found on NVMe: {:?}", e);
+                log::debug!("No ESP found on NVMe: {:?}", e);
             }
         }
-    } else {
-        log::info!("No NVMe controllers available");
+    }
+    false
+}
+
+/// Try to boot from AHCI/SATA
+fn try_boot_from_ahci() -> bool {
+    if let Some(controller) = drivers::ahci::get_controller(0) {
+        for port_index in 0..controller.num_active_ports() {
+            log::info!("Probing AHCI port {} for ESP...", port_index);
+
+            match fs::gpt::find_esp_on_ahci(controller, port_index) {
+                Ok(esp) => {
+                    log::info!(
+                        "Found ESP on AHCI port {}: LBA {}-{} ({} MB)",
+                        port_index,
+                        esp.first_lba,
+                        esp.last_lba,
+                        esp.size_bytes() / (1024 * 1024)
+                    );
+
+                    let mut disk = fs::gpt::AhciDisk::new(controller, port_index);
+
+                    if try_boot_from_esp(&mut disk, &esp) {
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    log::debug!("No ESP found on AHCI port {}: {:?}", port_index, e);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Try to boot from USB mass storage
+fn try_boot_from_usb() -> bool {
+    if let Some(xhci) = drivers::usb::get_controller(0) {
+        if let Some(slot_id) = xhci.find_mass_storage() {
+            log::info!("Found USB mass storage device on slot {}", slot_id);
+
+            // Create mass storage device
+            match drivers::usb::UsbMassStorage::new(xhci, slot_id) {
+                Ok(usb_device) => {
+                    // Store the device globally for later access by filesystem protocol
+                    if !drivers::usb::mass_storage::store_global_device(usb_device) {
+                        log::error!("Failed to store USB device globally");
+                        return false;
+                    }
+
+                    // Get the stored device for ESP detection
+                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                        if let Some(xhci) = drivers::usb::get_controller(0) {
+                            match fs::gpt::find_esp_on_usb(usb_device, xhci) {
+                                Ok(esp) => {
+                                    log::info!(
+                                        "Found ESP on USB: LBA {}-{} ({} MB)",
+                                        esp.first_lba,
+                                        esp.last_lba,
+                                        esp.size_bytes() / (1024 * 1024)
+                                    );
+
+                                    if let Some(usb_device) =
+                                        drivers::usb::mass_storage::get_global_device()
+                                    {
+                                        if let Some(xhci) = drivers::usb::get_controller(0) {
+                                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
+
+                                            if try_boot_from_esp_usb(&mut disk, &esp) {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::debug!("No ESP found on USB device: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to initialize USB mass storage: {:?}", e);
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Try to boot from an ESP on a given disk (generic version)
+fn try_boot_from_esp<R: fs::gpt::SectorRead>(disk: &mut R, esp: &fs::gpt::Partition) -> bool {
+    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+        Ok(mut fat) => {
+            log::info!("FAT filesystem mounted on ESP");
+
+            // Look for EFI bootloader
+            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            match fat.file_size(boot_path) {
+                Ok(size) => {
+                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
+
+                    // Load and execute the bootloader (no device handle)
+                    match load_and_execute_bootloader(
+                        &mut fat,
+                        boot_path,
+                        size,
+                        core::ptr::null_mut(),
+                    ) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            log::error!("Failed to execute bootloader: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Bootloader not found: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        }
+    }
+    false
+}
+
+/// Try to boot from an ESP on USB (with SimpleFileSystem support)
+fn try_boot_from_esp_usb(disk: &mut fs::gpt::UsbDisk, esp: &fs::gpt::Partition) -> bool {
+    use efi::boot_services;
+    use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
+    use r_efi::efi::Status;
+
+    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
+        Ok(mut fat) => {
+            log::info!("FAT filesystem mounted on ESP");
+
+            // Extract filesystem state for the SimpleFileSystem protocol
+            let fs_state = extract_fat_state(&fat, esp.first_lba);
+
+            // Initialize SimpleFileSystem protocol
+            let sfs_protocol =
+                simple_file_system::init(fs_state, drivers::usb::mass_storage::global_read_sector);
+
+            // Create a device handle with SimpleFileSystem protocol
+            let device_handle = match boot_services::create_handle() {
+                Some(h) => h,
+                None => {
+                    log::error!("Failed to create device handle");
+                    return false;
+                }
+            };
+
+            // Install SimpleFileSystem protocol on the device handle
+            let status = boot_services::install_protocol(
+                device_handle,
+                &SIMPLE_FILE_SYSTEM_GUID,
+                sfs_protocol as *mut core::ffi::c_void,
+            );
+
+            if status != Status::SUCCESS {
+                log::error!("Failed to install SimpleFileSystem protocol: {:?}", status);
+                return false;
+            }
+
+            log::info!(
+                "SimpleFileSystem protocol installed on device handle {:?}",
+                device_handle
+            );
+
+            // Look for EFI bootloader
+            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
+            match fat.file_size(boot_path) {
+                Ok(size) => {
+                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
+
+                    // Load and execute the bootloader with device handle
+                    match load_and_execute_bootloader(&mut fat, boot_path, size, device_handle) {
+                        Ok(()) => return true,
+                        Err(e) => {
+                            log::error!("Failed to execute bootloader: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Bootloader not found: {:?}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to mount FAT filesystem: {:?}", e);
+        }
+    }
+    false
+}
+
+/// Extract FAT filesystem state for the SimpleFileSystem protocol
+fn extract_fat_state<R: fs::gpt::SectorRead>(
+    _fat: &fs::fat::FatFilesystem<R>,
+    partition_start: u64,
+) -> efi::protocols::simple_file_system::FilesystemState {
+    use efi::protocols::simple_file_system::FilesystemState;
+    use fs::fat::SECTOR_SIZE;
+
+    // We need to re-read the boot sector to extract the parameters
+    // This is a bit wasteful but keeps the FAT module clean
+
+    // For now, use defaults - we'll read from disk
+    // TODO: Add accessor methods to FatFilesystem to get these values
+
+    // Read boot sector directly using global read
+    let mut buffer = [0u8; SECTOR_SIZE];
+    if let Err(_) = drivers::usb::mass_storage::global_read_sector(partition_start, &mut buffer) {
+        log::error!("Failed to read boot sector for filesystem state");
+        return FilesystemState::empty();
     }
 
-    // TODO: Also check AHCI/SATA controllers
-    log::info!("Storage initialization complete");
+    // Parse BPB
+    let bytes_per_sector = u16::from_le_bytes([buffer[11], buffer[12]]);
+    let sectors_per_cluster = buffer[13];
+    let reserved_sectors = u16::from_le_bytes([buffer[14], buffer[15]]);
+    let num_fats = buffer[16];
+    let root_entry_count = u16::from_le_bytes([buffer[17], buffer[18]]);
+    let total_sectors_16 = u16::from_le_bytes([buffer[19], buffer[20]]);
+    let sectors_per_fat_16 = u16::from_le_bytes([buffer[22], buffer[23]]);
+    let total_sectors_32 = u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]);
+
+    // FAT32 extended BPB
+    let sectors_per_fat_32 = u32::from_le_bytes([buffer[36], buffer[37], buffer[38], buffer[39]]);
+    let root_cluster = u32::from_le_bytes([buffer[44], buffer[45], buffer[46], buffer[47]]);
+
+    let sectors_per_fat = if sectors_per_fat_16 != 0 {
+        sectors_per_fat_16 as u32
+    } else {
+        sectors_per_fat_32
+    };
+
+    let total_sectors = if total_sectors_16 != 0 {
+        total_sectors_16 as u32
+    } else {
+        total_sectors_32
+    };
+
+    let root_dir_sectors =
+        ((root_entry_count as u32 * 32) + (bytes_per_sector as u32 - 1)) / bytes_per_sector as u32;
+    let fat_start = reserved_sectors as u32;
+    let root_dir_start = fat_start + (num_fats as u32 * sectors_per_fat);
+    let data_start = root_dir_start + root_dir_sectors;
+
+    let data_sectors = total_sectors - data_start;
+    let data_clusters = data_sectors / sectors_per_cluster as u32;
+
+    // Determine FAT type
+    let fat_type = if data_clusters < 4085 {
+        12
+    } else if data_clusters < 65525 {
+        16
+    } else {
+        32
+    };
+
+    let root_cluster_val = if fat_type == 32 { root_cluster } else { 0 };
+
+    log::debug!(
+        "FAT state: type={}, start={}, bps={}, spc={}",
+        fat_type,
+        partition_start,
+        bytes_per_sector,
+        sectors_per_cluster
+    );
+
+    FilesystemState {
+        partition_start,
+        fat_type,
+        bytes_per_sector,
+        sectors_per_cluster,
+        fat_start,
+        sectors_per_fat,
+        data_start,
+        root_cluster: root_cluster_val,
+        root_dir_start,
+        root_dir_sectors,
+    }
 }
 
 /// Load and execute an EFI bootloader from the filesystem
@@ -189,6 +464,7 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     fat: &mut fs::fat::FatFilesystem<R>,
     path: &str,
     file_size: u32,
+    device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
     use efi::allocator::{allocate_pool, free_pool, MemoryType};
     use efi::boot_services;
@@ -240,9 +516,9 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     let firmware_handle = efi::get_firmware_handle();
 
     let loaded_image_protocol = create_loaded_image_protocol(
-        firmware_handle,       // parent_handle
-        system_table,          // system_table
-        core::ptr::null_mut(), // device_handle (no device path yet)
+        firmware_handle, // parent_handle
+        system_table,    // system_table
+        device_handle,   // device_handle - now with SimpleFileSystem!
         loaded_image.image_base,
         loaded_image.image_size,
     );
@@ -266,6 +542,12 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     }
 
     log::info!("LoadedImageProtocol installed on handle {:?}", image_handle);
+    if !device_handle.is_null() {
+        log::info!(
+            "DeviceHandle set to {:?} (with SimpleFileSystem)",
+            device_handle
+        );
+    }
     log::info!("Executing bootloader...");
 
     // Execute the bootloader

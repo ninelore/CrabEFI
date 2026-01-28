@@ -130,6 +130,9 @@ extern "efiapi" fn text_output_string(
         return Status::INVALID_PARAMETER;
     }
 
+    // Log that bootloader is outputting text
+    log::trace!("ConOut.OutputString called");
+
     // Convert UCS-2 to ASCII and output
     let mut ptr = string;
     unsafe {

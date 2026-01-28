@@ -52,10 +52,10 @@ SECTIONS
         _bss_end = .;
     }
 
-    /* Stack - 64KB */
+    /* Stack - 256KB (increased from 64KB for large structs) */
     .stack : ALIGN(4096) {
         _stack_bottom = .;
-        . += 0x10000;
+        . += 0x200000;
         _stack_top = .;
     }
 

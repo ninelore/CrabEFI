@@ -166,7 +166,6 @@ pub fn parse(ptr: *const u8) -> CorebootInfo {
         Some(h) => h,
         None => {
             log::warn!("Could not find coreboot header, using fallback memory map");
-            // Create a fallback memory map for QEMU
             create_fallback_memory_map(&mut info);
             return info;
         }
@@ -336,7 +335,7 @@ unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHe
 
 /// Parse a single coreboot record
 unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
-    let tag = (*record).tag;
+    let tag = core::ptr::addr_of!((*record).tag).read_unaligned();
 
     match tag {
         tags::CB_TAG_MEMORY => {
@@ -357,7 +356,8 @@ unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
         tags::CB_TAG_VERSION => {
             // Version string follows the record header
             let string_ptr = (record as *const u8).add(8);
-            let len = (*record).size as usize - 8;
+            let record_size = core::ptr::addr_of!((*record).size).read_unaligned();
+            let len = record_size as usize - 8;
             if len > 0 {
                 let slice = core::slice::from_raw_parts(string_ptr, len);
                 if let Ok(s) = core::str::from_utf8(slice) {
@@ -374,16 +374,21 @@ unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
 
 /// Parse memory map from coreboot table
 unsafe fn parse_memory(record: *const CbRecord, info: &mut CorebootInfo) {
-    let size = (*record).size;
+    let size = core::ptr::addr_of!((*record).size).read_unaligned();
     let data = (record as *const u8).add(8); // Skip header
     let num_entries = (size as usize - 8) / core::mem::size_of::<CbMemoryRange>();
 
     log::debug!("Parsing {} memory regions", num_entries);
 
     for i in 0..num_entries {
-        let range = &*(data.add(i * core::mem::size_of::<CbMemoryRange>()) as *const CbMemoryRange);
+        let range_ptr = data.add(i * core::mem::size_of::<CbMemoryRange>()) as *const CbMemoryRange;
 
-        let region_type = match range.mem_type {
+        // Read fields using read_unaligned to handle packed struct
+        let start = core::ptr::addr_of!((*range_ptr).start).read_unaligned();
+        let range_size = core::ptr::addr_of!((*range_ptr).size).read_unaligned();
+        let mem_type = core::ptr::addr_of!((*range_ptr).mem_type).read_unaligned();
+
+        let region_type = match mem_type {
             1 => MemoryType::Ram,
             2 => MemoryType::Reserved,
             3 => MemoryType::AcpiReclaimable,
@@ -394,8 +399,8 @@ unsafe fn parse_memory(record: *const CbRecord, info: &mut CorebootInfo) {
         };
 
         let region = MemoryRegion {
-            start: range.start,
-            size: range.size,
+            start,
+            size: range_size,
             region_type,
         };
 
@@ -479,8 +484,49 @@ unsafe fn parse_forward(record: *const CbRecord, info: &mut CorebootInfo) {
 
     log::debug!("Following forward pointer to {:#x}", forward_addr);
 
-    // Recursively parse the forwarded table
-    *info = parse(new_ptr);
+    // Parse the forwarded table directly into info (no recursion)
+    let header = match find_header(new_ptr) {
+        Some(h) => h,
+        None => {
+            log::warn!("Could not find coreboot header at forwarded location");
+            return;
+        }
+    };
+
+    // Verify signature "LBIO"
+    if &(*header).signature != b"LBIO" {
+        log::warn!("Invalid coreboot header signature at forwarded location");
+        return;
+    }
+
+    // Read fields from packed struct using read_unaligned
+    let table_entries = core::ptr::addr_of!((*header).table_entries).read_unaligned();
+    let table_bytes = core::ptr::addr_of!((*header).table_bytes).read_unaligned();
+    let header_bytes = core::ptr::addr_of!((*header).header_bytes).read_unaligned();
+
+    log::debug!(
+        "Found coreboot header: {} table entries, {} bytes",
+        table_entries,
+        table_bytes
+    );
+
+    // Parse table entries
+    let table_start = (header as *const u8).add(header_bytes as usize);
+    let mut offset = 0u32;
+
+    while offset < table_bytes {
+        let record = table_start.add(offset as usize) as *const CbRecord;
+        let record_size = core::ptr::addr_of!((*record).size).read_unaligned();
+
+        if record_size < 8 {
+            log::warn!("Invalid record size: {}", record_size);
+            break;
+        }
+
+        parse_record(record, info);
+
+        offset += record_size;
+    }
 }
 
 /// Parse ACPI RSDP pointer

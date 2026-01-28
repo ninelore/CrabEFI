@@ -3,6 +3,7 @@
 //! This module provides parsing of GPT partitioned disks to find the EFI
 //! System Partition (ESP).
 
+use crate::drivers::ahci::AhciController;
 use crate::drivers::nvme::NvmeController;
 
 /// Sector size (standard for most disks)
@@ -223,6 +224,8 @@ impl<'a> SectorRead for NvmeDisk<'a> {
 pub fn read_gpt_header<R: SectorRead>(reader: &mut R) -> Result<GptHeader, GptError> {
     let mut buffer = [0u8; SECTOR_SIZE];
 
+    log::debug!("Reading GPT header from LBA 1...");
+
     // GPT header is at LBA 1 (sector 1)
     reader.read_sector(1, &mut buffer)?;
 
@@ -263,14 +266,29 @@ pub fn read_partitions<R: SectorRead>(
         (header.num_partition_entries as usize + entries_per_sector - 1) / entries_per_sector;
 
     let mut entry_index = 0u32;
+    let mut consecutive_empty = 0u32;
 
-    for sector_offset in 0..num_sectors {
+    'outer: for sector_offset in 0..num_sectors {
         let lba = header.partition_entry_lba + sector_offset as u64;
-        reader.read_sector(lba, &mut buffer)?;
+
+        // Try to read the sector, but don't fail if we've already found partitions
+        // and encounter a read error (some ISOs have truncated partition tables)
+        if let Err(e) = reader.read_sector(lba, &mut buffer) {
+            if !partitions.is_empty() {
+                log::debug!(
+                    "Stopping partition scan at LBA {} (read error after finding {} partitions): {:?}",
+                    lba,
+                    partitions.len(),
+                    e
+                );
+                break;
+            }
+            return Err(e);
+        }
 
         for i in 0..entries_per_sector {
             if entry_index >= header.num_partition_entries {
-                break;
+                break 'outer;
             }
 
             let offset = i * header.partition_entry_size as usize;
@@ -279,6 +297,7 @@ pub fn read_partitions<R: SectorRead>(
             };
 
             if !entry.is_empty() {
+                consecutive_empty = 0;
                 let partition = Partition {
                     type_guid: entry.type_guid,
                     partition_guid: entry.partition_guid,
@@ -299,7 +318,18 @@ pub fn read_partitions<R: SectorRead>(
 
                 if partitions.push(partition).is_err() {
                     log::warn!("Too many partitions, ignoring remaining");
-                    break;
+                    break 'outer;
+                }
+            } else {
+                consecutive_empty += 1;
+                // Stop scanning after 8 consecutive empty entries (2 sectors worth)
+                // This handles truncated partition tables in ISOs
+                if consecutive_empty >= 8 && !partitions.is_empty() {
+                    log::debug!(
+                        "Stopping partition scan after {} consecutive empty entries",
+                        consecutive_empty
+                    );
+                    break 'outer;
                 }
             }
 
@@ -342,5 +372,79 @@ pub fn find_esp_on_nvme(controller: &mut NvmeController) -> Result<Partition, Gp
         .ok_or(GptError::ReadError)?;
 
     let mut disk = NvmeDisk::new(controller, nsid);
+    find_esp(&mut disk)
+}
+
+/// Wrapper around AHCI controller for SectorRead trait
+pub struct AhciDisk<'a> {
+    controller: &'a mut AhciController,
+    port_index: usize,
+}
+
+impl<'a> AhciDisk<'a> {
+    pub fn new(controller: &'a mut AhciController, port_index: usize) -> Self {
+        Self {
+            controller,
+            port_index,
+        }
+    }
+}
+
+impl<'a> SectorRead for AhciDisk<'a> {
+    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
+        if buffer.len() < SECTOR_SIZE {
+            return Err(GptError::BufferTooSmall);
+        }
+
+        self.controller
+            .read_sectors(self.port_index, lba, 1, buffer.as_mut_ptr())
+            .map_err(|_| GptError::ReadError)
+    }
+}
+
+/// Find ESP on an AHCI controller
+pub fn find_esp_on_ahci(
+    controller: &mut AhciController,
+    port_index: usize,
+) -> Result<Partition, GptError> {
+    let mut disk = AhciDisk::new(controller, port_index);
+    find_esp(&mut disk)
+}
+
+use crate::drivers::usb::{UsbMassStorage, XhciController};
+
+/// Wrapper around USB mass storage for SectorRead trait
+pub struct UsbDisk<'a> {
+    device: &'a mut UsbMassStorage,
+    controller: &'a mut XhciController,
+}
+
+impl<'a> UsbDisk<'a> {
+    pub fn new(device: &'a mut UsbMassStorage, controller: &'a mut XhciController) -> Self {
+        Self { device, controller }
+    }
+}
+
+impl<'a> SectorRead for UsbDisk<'a> {
+    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
+        if buffer.len() < SECTOR_SIZE {
+            return Err(GptError::BufferTooSmall);
+        }
+
+        self.device
+            .read_sectors(self.controller, lba, 1, buffer)
+            .map_err(|e| {
+                log::debug!("USB read_sector failed at LBA {}: {:?}", lba, e);
+                GptError::ReadError
+            })
+    }
+}
+
+/// Find ESP on a USB mass storage device
+pub fn find_esp_on_usb(
+    device: &mut UsbMassStorage,
+    controller: &mut XhciController,
+) -> Result<Partition, GptError> {
+    let mut disk = UsbDisk::new(device, controller);
     find_esp(&mut disk)
 }

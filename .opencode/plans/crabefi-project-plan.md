@@ -191,34 +191,34 @@ CrabEFI/
 - Release binary size: ~244KB
 - Debug binary size: ~540KB
 
-### Phase 3: Storage Stack (Weeks 5-7)
+### Phase 3: Storage Stack (Weeks 5-7) ✅ COMPLETE
 
 **Goal**: Read files from ESP partition on real storage devices
 
 **Tasks**:
-1. Implement PCI enumeration:
+1. ✅ Implement PCI enumeration:
    - Scan PCI configuration space
    - PCIe ECAM support
    - BAR allocation
-2. NVMe driver:
+2. ✅ NVMe driver:
    - Admin command queue
    - I/O submission/completion queues
    - Identify Controller/Namespace
    - Read command
-3. AHCI driver:
+3. ✅ AHCI driver:
    - HBA initialization
    - Port initialization
    - IDENTIFY DEVICE
    - READ DMA EXT
-4. GPT partition parser:
+4. ✅ GPT partition parser:
    - Read protective MBR
    - Parse GPT header and entries
    - Find EFI System Partition by GUID
-5. FAT filesystem:
+5. ✅ FAT filesystem:
    - FAT12/16/32 support
    - Directory traversal
    - File reading
-6. EFI protocols:
+6. ✅ EFI protocols:
    - `EFI_BLOCK_IO_PROTOCOL`
    - `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`
    - `EFI_FILE_PROTOCOL`
@@ -234,6 +234,8 @@ CrabEFI/
 - `src/fs/fat.rs`
 - `src/efi/protocols/block_io.rs`
 - `src/efi/protocols/simple_fs.rs`
+
+**Completed**: January 28, 2026
 
 ### Phase 4: Graphics & Input (Weeks 8-9)
 
@@ -260,18 +262,18 @@ CrabEFI/
 - `src/drivers/keyboard.rs`
 - `src/efi/protocols/console.rs`
 
-### Phase 5: USB Support (Weeks 10-11)
+### Phase 5: USB Support (Weeks 10-11) ✅ COMPLETE
 
 **Goal**: Boot from USB storage devices
 
 **Tasks**:
-1. xHCI driver:
+1. ✅ xHCI driver:
    - Controller initialization
    - Command ring
    - Event ring (interrupt polling)
    - Device slot allocation
    - Device enumeration
-2. USB mass storage:
+2. ✅ USB mass storage:
    - Bulk-Only Transport (BOT) protocol
    - SCSI command set (INQUIRY, READ CAPACITY, READ)
 3. USB HID keyboard (optional):
@@ -283,6 +285,8 @@ CrabEFI/
 **Key files**:
 - `src/drivers/usb/xhci.rs`
 - `src/drivers/usb/mass_storage.rs`
+
+**Completed**: January 28, 2026
 
 ### Phase 6: Polish & Testing (Weeks 12+)
 

@@ -872,7 +872,14 @@ pub fn init() {
         match NvmeController::new(dev) {
             Ok(controller) => {
                 // Box the controller (we don't have alloc, so use EFI allocator)
-                let controller_ptr = efi::allocate_pages(1);
+                let size = core::mem::size_of::<NvmeController>();
+                let pages = (size + 4095) / 4096;
+                log::debug!(
+                    "NVMe: Allocating {} pages ({} bytes) for NvmeController",
+                    pages,
+                    size
+                );
+                let controller_ptr = efi::allocate_pages(pages as u64);
                 if let Some(ptr) = controller_ptr {
                     let controller_box = ptr as *mut NvmeController;
                     unsafe {

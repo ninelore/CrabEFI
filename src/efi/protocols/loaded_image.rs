@@ -64,10 +64,15 @@ pub fn create_loaded_image_protocol(
     }
 
     log::debug!(
-        "Created LoadedImageProtocol: base={:#x}, size={:#x}",
+        "Created LoadedImageProtocol: base={:#x}, size={:#x}, device_handle={:?}",
         image_base,
-        image_size
+        image_size,
+        device_handle
     );
+
+    if device_handle.is_null() {
+        log::warn!("LoadedImageProtocol: DeviceHandle is NULL - bootloader won't be able to access boot device!");
+    }
 
     ptr
 }
