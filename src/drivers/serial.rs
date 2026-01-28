@@ -47,10 +47,15 @@ mod lcr {
 /// Global serial port instance
 static SERIAL: Mutex<Option<SerialPort>> = Mutex::new(None);
 
+/// Maximum iterations to wait for TX ready (prevents infinite loop on missing hardware)
+const TX_TIMEOUT_ITERATIONS: u32 = 100_000;
+
 /// A 16550 UART serial port
 pub struct SerialPort {
     /// Base I/O port address
     base: u16,
+    /// Whether this port has been detected as functional
+    functional: bool,
 }
 
 impl SerialPort {
@@ -60,11 +65,52 @@ impl SerialPort {
     ///
     /// The base address must be a valid I/O port for a 16550 UART.
     pub const unsafe fn new(base: u16) -> Self {
-        SerialPort { base }
+        SerialPort {
+            base,
+            functional: false,
+        }
+    }
+
+    /// Check if a serial port exists at this address
+    ///
+    /// Uses the scratch register test: write a value, read it back.
+    /// If we get back what we wrote, a UART is likely present.
+    fn detect(&self) -> bool {
+        unsafe {
+            // The scratch register (offset 7) can be used for detection
+            const SCRATCH: u16 = 7;
+
+            // Try writing and reading back a test pattern
+            self.write_reg(SCRATCH, 0x55);
+            if self.read_reg(SCRATCH) != 0x55 {
+                return false;
+            }
+
+            self.write_reg(SCRATCH, 0xAA);
+            if self.read_reg(SCRATCH) != 0xAA {
+                return false;
+            }
+
+            // Also check that LSR doesn't return 0xFF (unpopulated port)
+            let lsr = self.read_reg(registers::LSR);
+            if lsr == 0xFF {
+                return false;
+            }
+
+            true
+        }
     }
 
     /// Initialize the serial port with the given baud rate
-    pub fn init(&mut self, baud: u32) {
+    ///
+    /// Returns true if initialization succeeded, false if no serial port detected.
+    pub fn init(&mut self, baud: u32) -> bool {
+        // First check if a serial port exists
+        if !self.detect() {
+            self.functional = false;
+            return false;
+        }
+
         let divisor = 115200 / baud;
 
         unsafe {
@@ -90,13 +136,27 @@ impl SerialPort {
             // IRQs enabled, RTS/DSR set
             self.write_reg(registers::MCR, 0x0B);
         }
+
+        self.functional = true;
+        true
     }
 
     /// Write a byte to the serial port
     pub fn write_byte(&mut self, byte: u8) {
+        if !self.functional {
+            return;
+        }
+
         unsafe {
-            // Wait for transmit buffer to be empty
+            // Wait for transmit buffer to be empty, with timeout
+            let mut timeout = TX_TIMEOUT_ITERATIONS;
             while (self.read_reg(registers::LSR) & lsr::TX_EMPTY) == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    // Serial port not responding, mark as non-functional
+                    self.functional = false;
+                    return;
+                }
                 core::hint::spin_loop();
             }
 
@@ -175,14 +235,28 @@ impl Write for SerialPort {
 }
 
 /// Initialize the global serial port for early debug output
+///
+/// This is a no-op now - we wait for coreboot tables to tell us the serial port.
+/// Call `init_from_coreboot()` after parsing coreboot tables.
 pub fn init_early() {
-    let mut serial = unsafe { SerialPort::new(COM1) };
-    serial.init(115200);
+    // Don't initialize serial until we know from coreboot tables if one exists
+    // and what address it's at. This prevents hanging on systems without serial.
+}
 
-    // Test the serial port
-    let _ = serial.write_str("\r\n");
+/// Initialize serial port from coreboot table information
+///
+/// # Arguments
+/// * `base_addr` - I/O port base address from coreboot serial info
+/// * `baud` - Baud rate (typically 115200)
+pub fn init_from_coreboot(base_addr: u32, baud: u32) {
+    let mut serial = unsafe { SerialPort::new(base_addr as u16) };
 
-    *SERIAL.lock() = Some(serial);
+    if serial.init(baud) {
+        // Test the serial port
+        let _ = serial.write_str("\r\n[CrabEFI] Serial initialized from coreboot\r\n");
+        *SERIAL.lock() = Some(serial);
+    }
+    // If no serial port detected, SERIAL remains None and all output is silently dropped
 }
 
 /// Write a string to the serial port
