@@ -1505,6 +1505,43 @@ impl XhciController {
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
     }
+
+    /// Clean up the controller before handing off to the OS
+    ///
+    /// This must be called before ExitBootServices to ensure Linux's xHCI
+    /// driver can properly initialize the controller.
+    pub fn cleanup(&mut self) {
+        log::debug!("xHCI cleanup: stopping controller");
+
+        // 1. Stop the controller (clear RS bit)
+        let cmd = self.read_op_reg(op_regs::USBCMD);
+        self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::RS);
+
+        // Wait for halt (HCH bit set)
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if self.read_op_reg(op_regs::USBSTS) & usbsts::HCH != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // 2. Reset the controller (optional but helps ensure clean state)
+        self.write_op_reg(op_regs::USBCMD, usbcmd::HCRST);
+
+        // Wait for reset to complete (HCRST clears and CNR clears)
+        let timeout = Timeout::from_ms(500);
+        while !timeout.is_expired() {
+            let cmd = self.read_op_reg(op_regs::USBCMD);
+            let sts = self.read_op_reg(op_regs::USBSTS);
+            if (cmd & usbcmd::HCRST) == 0 && (sts & usbsts::CNR) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        log::debug!("xHCI cleanup complete");
+    }
 }
 
 /// Wrapper for xHCI controller pointer to implement Send
@@ -1576,6 +1613,19 @@ pub fn init() {
 pub fn get_controller(index: usize) -> Option<&'static mut XhciController> {
     let controllers = XHCI_CONTROLLERS.lock();
     controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
+}
+
+/// Clean up all xHCI controllers from the legacy init path
+///
+/// This is called from usb::cleanup() to ensure controllers initialized
+/// via xhci::init() are also cleaned up.
+pub fn cleanup() {
+    let controllers = XHCI_CONTROLLERS.lock();
+
+    for ptr in controllers.iter() {
+        let controller = unsafe { &mut *ptr.0 };
+        controller.cleanup();
+    }
 }
 
 // Ensure XhciController can be sent between threads
