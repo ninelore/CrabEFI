@@ -4,6 +4,7 @@
 
 pub mod block_io;
 pub mod console;
+pub mod console_control;
 pub mod device_path;
 pub mod graphics_output;
 pub mod loaded_image;

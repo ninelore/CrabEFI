@@ -50,6 +50,8 @@ pub fn init(cb_info: &CorebootInfo) {
         if let Some(handle) = console_handle {
             init_graphics_output_on_handle(fb, handle);
         }
+        // Initialize EFI console framebuffer output (bootloader text goes here too)
+        protocols::console::init_framebuffer(fb.clone());
     }
 
     // Install Unicode Collation protocol
@@ -60,6 +62,9 @@ pub fn init(cb_info: &CorebootInfo) {
 
     // Install Serial IO protocol
     init_serial_io();
+
+    // Install Console Control protocol (legacy, but some bootloaders need it)
+    init_console_control();
 
     log::info!("EFI environment initialized");
 }
@@ -231,6 +236,39 @@ fn init_serial_io() {
     }
 
     log::debug!("Serial IO protocol installed on handle {:?}", handle);
+}
+
+/// Initialize Console Control protocol (legacy Intel EFI protocol)
+fn init_console_control() {
+    use protocols::console_control::{create_protocol, CONSOLE_CONTROL_PROTOCOL_GUID};
+
+    // Create a handle for Console Control protocol
+    let handle = match boot_services::create_handle() {
+        Some(h) => h,
+        None => {
+            log::error!("Failed to create Console Control handle");
+            return;
+        }
+    };
+
+    // Create and install the protocol
+    let protocol = create_protocol();
+    if protocol.is_null() {
+        log::error!("Failed to create Console Control protocol");
+        return;
+    }
+
+    let status = boot_services::install_protocol(
+        handle,
+        &CONSOLE_CONTROL_PROTOCOL_GUID,
+        protocol as *mut core::ffi::c_void,
+    );
+    if status != Status::SUCCESS {
+        log::error!("Failed to install Console Control protocol: {:?}", status);
+        return;
+    }
+
+    log::debug!("Console Control protocol installed on handle {:?}", handle);
 }
 
 /// Initialize Graphics Output Protocol (GOP) on a specific handle

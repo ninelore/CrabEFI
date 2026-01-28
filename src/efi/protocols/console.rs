@@ -9,9 +9,11 @@
 //! - Serial console: ANSI escape sequences are parsed for arrow keys, function keys, etc.
 //! - PS/2 keyboard: Scancodes are translated to EFI keys via the i8042 keyboard controller.
 
+use crate::coreboot::FramebufferInfo;
 use crate::drivers::keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
+use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};
@@ -19,6 +21,146 @@ use r_efi::protocols::simple_text_output::{
     Mode as SimpleTextOutputMode, Protocol as SimpleTextOutputProtocol,
 };
 use spin::Mutex;
+
+// ============================================================================
+// EFI Framebuffer Console State
+// ============================================================================
+
+/// Framebuffer info for EFI console output
+static EFI_FB: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
+
+/// EFI console cursor position (col, row)
+static EFI_CURSOR: Mutex<(u32, u32)> = Mutex::new((0, 0));
+
+/// EFI console dimensions (cols, rows)
+static EFI_DIMS: Mutex<(u32, u32)> = Mutex::new((80, 25));
+
+/// Initialize the EFI console with framebuffer support
+pub fn init_framebuffer(fb: FramebufferInfo) {
+    let cols = fb.x_resolution / CHAR_WIDTH;
+    let rows = fb.y_resolution / CHAR_HEIGHT;
+
+    // Reserve top portion for debug log, use bottom portion for EFI console
+    // Use bottom half of screen for EFI console output
+    let efi_start_row = rows / 2;
+
+    *EFI_DIMS.lock() = (cols, rows - efi_start_row);
+    *EFI_CURSOR.lock() = (0, efi_start_row);
+    *EFI_FB.lock() = Some(fb);
+
+    log::info!(
+        "EFI console initialized: {}x{} chars, starting at row {}",
+        cols,
+        rows - efi_start_row,
+        efi_start_row
+    );
+}
+
+/// Write a character to the EFI framebuffer console
+fn fb_put_char(c: char) {
+    let fb_guard = EFI_FB.lock();
+    let Some(ref fb) = *fb_guard else { return };
+
+    let dims = *EFI_DIMS.lock();
+    let (cols, _rows) = dims;
+    let total_rows = fb.y_resolution / CHAR_HEIGHT;
+    let start_row = total_rows / 2; // EFI console starts at bottom half
+
+    let mut cursor = EFI_CURSOR.lock();
+    let (mut col, mut row) = *cursor;
+
+    match c {
+        '\n' => {
+            col = 0;
+            row += 1;
+            if row >= total_rows {
+                // Scroll up the bottom half
+                fb_scroll_up(fb, start_row, total_rows);
+                row = total_rows - 1;
+            }
+        }
+        '\r' => {
+            col = 0;
+        }
+        _ => {
+            fb_draw_char(fb, c, col, row);
+            col += 1;
+            if col >= cols {
+                col = 0;
+                row += 1;
+                if row >= total_rows {
+                    fb_scroll_up(fb, start_row, total_rows);
+                    row = total_rows - 1;
+                }
+            }
+        }
+    }
+
+    *cursor = (col, row);
+}
+
+/// Draw a character at a specific position
+fn fb_draw_char(fb: &FramebufferInfo, c: char, col: u32, row: u32) {
+    let x_base = col * CHAR_WIDTH;
+    let y_base = row * CHAR_HEIGHT;
+
+    let glyph = if (c as usize) < 256 {
+        &VGA_FONT_8X16[c as usize]
+    } else {
+        &VGA_FONT_8X16[b'?' as usize]
+    };
+
+    // White on black for EFI console
+    let (fg_r, fg_g, fg_b) = (255u8, 255u8, 255u8);
+    let (bg_r, bg_g, bg_b) = (0u8, 0u8, 0u8);
+
+    for glyph_row in 0..CHAR_HEIGHT {
+        let bits = glyph[glyph_row as usize];
+        for glyph_col in 0..CHAR_WIDTH {
+            let pixel_set = (bits >> (7 - glyph_col)) & 1 != 0;
+            let (r, g, b) = if pixel_set {
+                (fg_r, fg_g, fg_b)
+            } else {
+                (bg_r, bg_g, bg_b)
+            };
+            unsafe {
+                fb.write_pixel(x_base + glyph_col, y_base + glyph_row, r, g, b);
+            }
+        }
+    }
+}
+
+/// Scroll the EFI console area up by one line
+fn fb_scroll_up(fb: &FramebufferInfo, start_row: u32, total_rows: u32) {
+    let row_stride = fb.bytes_per_line as usize;
+
+    // Copy each row up
+    for row in start_row..(total_rows - 1) {
+        let src_y = (row + 1) * CHAR_HEIGHT;
+        let dst_y = row * CHAR_HEIGHT;
+
+        for line in 0..CHAR_HEIGHT {
+            let src_offset = ((src_y + line) as usize) * row_stride;
+            let dst_offset = ((dst_y + line) as usize) * row_stride;
+
+            unsafe {
+                let src = (fb.physical_address as *const u8).add(src_offset);
+                let dst = (fb.physical_address as *mut u8).add(dst_offset);
+                core::ptr::copy(src, dst, row_stride);
+            }
+        }
+    }
+
+    // Clear the last row
+    let last_row_y = (total_rows - 1) * CHAR_HEIGHT;
+    for line in 0..CHAR_HEIGHT {
+        let offset = ((last_row_y + line) as usize) * row_stride;
+        unsafe {
+            let dst = (fb.physical_address as *mut u8).add(offset);
+            core::ptr::write_bytes(dst, 0, row_stride);
+        }
+    }
+}
 
 /// Simple Text Input Protocol GUID
 pub const SIMPLE_TEXT_INPUT_PROTOCOL_GUID: Guid = Guid::from_fields(
@@ -449,10 +591,7 @@ extern "efiapi" fn text_output_string(
         return Status::INVALID_PARAMETER;
     }
 
-    // Log that bootloader is outputting text
-    log::trace!("ConOut.OutputString called");
-
-    // Convert UCS-2 to ASCII and output
+    // Convert UCS-2 to ASCII and output to both serial and framebuffer
     let mut ptr = string;
     unsafe {
         while *ptr != 0 {
@@ -461,26 +600,31 @@ extern "efiapi" fn text_output_string(
             if ch < 128 {
                 // ASCII character
                 let byte = ch as u8;
+                let c = byte as char;
 
                 match byte {
                     b'\n' => {
                         serial::write_byte(b'\r');
                         serial::write_byte(b'\n');
+                        fb_put_char('\n');
                         CONSOLE_MODE.cursor_column = 0;
                         CONSOLE_MODE.cursor_row += 1;
                     }
                     b'\r' => {
                         serial::write_byte(b'\r');
+                        fb_put_char('\r');
                         CONSOLE_MODE.cursor_column = 0;
                     }
                     _ => {
                         serial::write_byte(byte);
+                        fb_put_char(c);
                         CONSOLE_MODE.cursor_column += 1;
                     }
                 }
             } else {
                 // Non-ASCII: output '?'
                 serial::write_byte(b'?');
+                fb_put_char('?');
                 CONSOLE_MODE.cursor_column += 1;
             }
 
