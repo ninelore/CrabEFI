@@ -27,7 +27,7 @@ pub mod xhci;
 
 pub use self::controller::{DeviceInfo, UsbController, UsbError, UsbSpeed};
 pub use mass_storage::UsbMassStorage;
-pub use xhci::{get_controller, XhciController, XhciError};
+pub use xhci::{XhciController, XhciError};
 
 use crate::drivers::pci;
 use crate::efi;
@@ -257,9 +257,6 @@ pub fn init_all() {
     // Initialize all controllers
     init();
 
-    // Also run the legacy xhci::init() for compatibility
-    xhci::init();
-
     // Initialize USB keyboards
     init_keyboards();
 }
@@ -297,9 +294,6 @@ pub fn cleanup() {
             controller.cleanup();
         });
     }
-
-    // Also clean up any xHCI controllers from the legacy init path
-    xhci::cleanup();
 
     log::info!("USB cleanup complete");
 }

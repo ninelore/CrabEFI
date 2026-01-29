@@ -42,7 +42,9 @@ const INVALID_VENDOR_ID: u16 = 0xFFFF;
 
 /// PCI header types
 const HEADER_TYPE_NORMAL: u8 = 0x00;
+#[allow(dead_code)]
 const HEADER_TYPE_BRIDGE: u8 = 0x01;
+#[allow(dead_code)]
 const HEADER_TYPE_CARDBUS: u8 = 0x02;
 const HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
 
@@ -70,16 +72,6 @@ impl PciAddress {
         addr |= (self.device as u32) << 11;
         addr |= (self.function as u32) << 8;
         addr |= (offset as u32) & 0xFC; // Must be 4-byte aligned
-        addr
-    }
-
-    /// Calculate ECAM offset for a register
-    fn ecam_offset(&self, offset: u16) -> u64 {
-        let mut addr = 0u64;
-        addr |= (self.bus as u64) << 20;
-        addr |= (self.device as u64) << 15;
-        addr |= (self.function as u64) << 12;
-        addr |= (offset as u64) & 0xFFF;
         addr
     }
 }

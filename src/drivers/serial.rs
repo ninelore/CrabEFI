@@ -25,6 +25,7 @@ mod registers {
 }
 
 /// Line Status Register bits
+#[allow(dead_code)]
 mod lsr {
     pub const DATA_READY: u8 = 1 << 0;
     pub const OVERRUN_ERROR: u8 = 1 << 1;

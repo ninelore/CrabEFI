@@ -34,6 +34,7 @@ mod status {
 }
 
 /// Controller commands (written to port 0x64)
+#[allow(dead_code)]
 mod cmd {
     /// Read controller configuration byte
     pub const READ_CONFIG: u8 = 0x20;
@@ -56,6 +57,7 @@ mod cmd {
 }
 
 /// Keyboard commands (written to port 0x60)
+#[allow(dead_code)]
 mod kb_cmd {
     /// Set LEDs (followed by LED byte)
     pub const SET_LEDS: u8 = 0xED;
@@ -74,6 +76,7 @@ mod kb_cmd {
 }
 
 /// Configuration byte bits
+#[allow(dead_code)]
 mod config {
     /// Enable keyboard interrupt (IRQ1)
     pub const KB_INT: u8 = 1 << 0;
@@ -90,6 +93,7 @@ mod config {
 }
 
 /// Keyboard response codes
+#[allow(dead_code)]
 mod response {
     /// Command acknowledged
     pub const ACK: u8 = 0xFA;

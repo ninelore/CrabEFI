@@ -12,6 +12,7 @@ use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 
 /// AHCI HBA (Host Bus Adapter) memory registers
+#[allow(dead_code)]
 mod regs {
     /// Host Capabilities
     pub const CAP: u32 = 0x00;
@@ -43,6 +44,7 @@ mod regs {
 }
 
 /// AHCI Port registers (relative to port base)
+#[allow(dead_code)]
 mod port_regs {
     /// Port Command List Base Address (low)
     pub const CLB: u32 = 0x00;
@@ -79,6 +81,7 @@ mod port_regs {
 }
 
 /// GHC register bits
+#[allow(dead_code)]
 mod ghc {
     /// HBA Reset
     pub const HR: u32 = 1 << 0;
@@ -89,6 +92,7 @@ mod ghc {
 }
 
 /// Port CMD register bits
+#[allow(dead_code)]
 mod port_cmd {
     /// Start (command list processing)
     pub const ST: u32 = 1 << 0;
@@ -163,6 +167,7 @@ mod signatures {
 }
 
 /// FIS Types
+#[allow(dead_code)]
 mod fis_type {
     /// Register FIS - Host to Device
     pub const REG_H2D: u8 = 0x27;
@@ -183,6 +188,7 @@ mod fis_type {
 }
 
 /// ATA Commands
+#[allow(dead_code)]
 mod ata_cmd {
     /// Read DMA Extended (48-bit LBA)
     pub const READ_DMA_EXT: u8 = 0x25;
@@ -199,6 +205,7 @@ mod ata_cmd {
 }
 
 /// SCSI Commands (used with ATAPI PACKET command)
+#[allow(dead_code)]
 mod scsi_cmd {
     /// Read (10) - read sectors
     pub const READ_10: u8 = 0x28;
@@ -414,10 +421,12 @@ pub struct AhciPort {
     /// Port number
     pub port_num: u8,
     /// MMIO base for port registers
+    #[allow(dead_code)]
     port_base: u64,
     /// Command list (32 entries, 1KB)
     cmd_list: *mut CommandHeader,
     /// Received FIS (256 bytes)
+    #[allow(dead_code)]
     received_fis: *mut ReceivedFis,
     /// Command tables (one per command slot)
     cmd_tables: [*mut CommandTable; 32],
@@ -447,7 +456,8 @@ pub struct AhciController {
     mmio_base: u64,
     /// Number of command slots
     num_cmd_slots: u8,
-    /// Number of ports
+    /// Number of ports (kept for hardware completeness)
+    #[allow(dead_code)]
     num_ports: u8,
     /// Ports implemented bitmap
     ports_implemented: u32,
@@ -569,14 +579,6 @@ impl AhciController {
         unsafe { ptr::write_volatile((mmio_base + offset as u64) as *mut u32, value) }
     }
 
-    fn read_reg(&self, offset: u32) -> u32 {
-        Self::read_reg_static(self.mmio_base, offset)
-    }
-
-    fn write_reg(&mut self, offset: u32, value: u32) {
-        Self::write_reg_static(self.mmio_base, offset, value)
-    }
-
     fn port_offset(port: u8) -> u32 {
         regs::PORT_BASE + (port as u32) * regs::PORT_SIZE
     }
@@ -672,12 +674,6 @@ impl AhciController {
 
         log::info!("AHCI: {} ports initialized", self.ports.len());
         Ok(())
-    }
-
-    /// Initialize all implemented ports (legacy version without SSS)
-    #[allow(dead_code)]
-    fn init_ports(&mut self) -> Result<(), AhciError> {
-        self.init_ports_with_sss(false)
     }
 
     /// Initialize a single port

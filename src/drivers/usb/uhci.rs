@@ -23,6 +23,7 @@ use super::controller::{
 // ============================================================================
 
 /// UHCI I/O Registers
+#[allow(dead_code)]
 mod regs {
     /// USB Command
     pub const USBCMD: u16 = 0x00;
@@ -43,6 +44,7 @@ mod regs {
 }
 
 /// USB Command Register bits
+#[allow(dead_code)]
 mod usbcmd {
     /// Run/Stop
     pub const RS: u16 = 1 << 0;
@@ -63,6 +65,7 @@ mod usbcmd {
 }
 
 /// USB Status Register bits
+#[allow(dead_code)]
 mod usbsts {
     /// USB Interrupt
     pub const USBINT: u16 = 1 << 0;
@@ -79,6 +82,7 @@ mod usbsts {
 }
 
 /// Port Status/Control bits
+#[allow(dead_code)]
 mod portsc {
     /// Current Connect Status
     pub const CCS: u16 = 1 << 0;
@@ -426,20 +430,6 @@ impl UhciController {
                 in("ax") value,
                 options(nostack, preserves_flags)
             );
-        }
-    }
-
-    /// Read dword from I/O port
-    fn inl(&self, offset: u16) -> u32 {
-        unsafe {
-            let mut value: u32;
-            core::arch::asm!(
-                "in eax, dx",
-                out("eax") value,
-                in("dx") self.io_base + offset,
-                options(nostack, preserves_flags)
-            );
-            value
         }
     }
 

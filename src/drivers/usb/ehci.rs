@@ -143,6 +143,7 @@ pub struct EhciOpRegs {
 }
 
 /// USB Command Register bits
+#[allow(dead_code)]
 mod usbcmd {
     /// Run/Stop
     pub const RS: u32 = 1 << 0;
@@ -169,6 +170,7 @@ mod usbcmd {
 }
 
 /// USB Status Register bits
+#[allow(dead_code)]
 mod usbsts {
     /// USB Interrupt
     pub const USBINT: u32 = 1 << 0;
@@ -193,6 +195,7 @@ mod usbsts {
 }
 
 /// Port Status/Control Register bits
+#[allow(dead_code)]
 mod portsc {
     /// Current Connect Status
     pub const CCS: u32 = 1 << 0;
@@ -533,9 +536,11 @@ const MAX_PORTS: usize = 15;
 pub struct EhciController {
     /// PCI address
     pci_address: PciAddress,
-    /// MMIO base address
+    /// MMIO base address (kept for hardware completeness)
+    #[allow(dead_code)]
     mmio_base: u64,
-    /// Capability registers base
+    /// Capability registers base (kept for hardware completeness)
+    #[allow(dead_code)]
     cap_regs: u64,
     /// Operational registers base
     op_regs: u64,

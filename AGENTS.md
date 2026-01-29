@@ -221,6 +221,9 @@ impl SectorRead for MyDisk {
 }
 ```
 
+### Legacy code
+If you see the possibility to unify codepaths, do so. We NOT need legacy code to be kept around. Do no allow dead_code
+
 ## Reference Implementations
 - U-Boot EFI loader: `~/src/u-boot/lib/efi_loader/`
 - coreboot libpayload: `~/src/coreboot/payloads/libpayload/`

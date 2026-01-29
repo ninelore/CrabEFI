@@ -23,6 +23,7 @@ use super::controller::{
 // ============================================================================
 
 /// OHCI Operational Registers
+#[allow(dead_code)]
 mod regs {
     /// Revision
     pub const HCREVISION: u32 = 0x00;
@@ -71,6 +72,7 @@ mod regs {
 }
 
 /// HcControl register bits
+#[allow(dead_code)]
 mod hccontrol {
     /// Control/Bulk Service Ratio
     pub const CBSR_MASK: u32 = 3 << 0;
@@ -109,6 +111,7 @@ mod hccommandstatus {
 }
 
 /// Root Hub Port Status bits
+#[allow(dead_code)]
 mod rhportstatus {
     /// Current Connect Status
     pub const CCS: u32 = 1 << 0;

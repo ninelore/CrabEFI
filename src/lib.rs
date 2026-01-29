@@ -5,7 +5,6 @@
 
 #![no_std]
 #![feature(abi_x86_interrupt)]
-#![allow(dead_code)]
 #![allow(unsafe_op_in_unsafe_fn)]
 
 // Note: We don't use alloc for now as we don't have a heap allocator yet
@@ -352,67 +351,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             }
             log::error!("Failed to boot AHCI entry");
         }
-        menu::DeviceType::Usb { slot_id: _ } => {
-            use drivers::storage::{self, StorageType};
-
-            // USB device should already be stored globally from discovery
-            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                if let Some(xhci) = drivers::usb::get_controller(0) {
-                    // Get disk info for storage registration
-                    let num_blocks = usb_device.num_blocks;
-                    let block_size = usb_device.block_size;
-
-                    // Register with storage abstraction (needed for BlockIO)
-                    let storage_id = match storage::register_device(
-                        StorageType::Usb { slot_id: 0 },
-                        num_blocks,
-                        block_size,
-                    ) {
-                        Some(id) => id,
-                        None => {
-                            log::error!("Failed to register USB device with storage");
-                            return;
-                        }
-                    };
-
-                    // Get PCI address
-                    let pci_addr = xhci.pci_address();
-
-                    // Create disk for partition installation
-                    let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
-
-                    // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
-                    let _ = install_block_io_for_disk(
-                        &mut disk,
-                        storage_id,
-                        block_size,
-                        num_blocks,
-                        pci_addr.device,
-                        pci_addr.function,
-                        0, // USB port
-                    );
-
-                    // Re-create disk and boot from ESP
-                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                        if let Some(xhci) = drivers::usb::get_controller(0) {
-                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
-                            if try_boot_from_esp_usb(
-                                &mut disk,
-                                &entry.partition,
-                                entry.partition_num,
-                                entry.pci_device,
-                                entry.pci_function,
-                                0, // USB port (default)
-                            ) {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-            log::error!("Failed to boot USB entry");
-        }
-        menu::DeviceType::UsbGeneric {
+        menu::DeviceType::Usb {
             controller_id,
             device_addr: _,
         } => {
@@ -452,7 +391,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 
                 // Create disk for partition installation
                 if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+                    let mut disk = fs::gpt::UsbDisk::new(usb_device, controller);
 
                     // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
                     let _ = install_block_io_for_disk(
@@ -470,7 +409,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                 // (previous borrows have ended)
                 let controller = unsafe { &mut *controller_ptr };
                 if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+                    let mut disk = fs::gpt::UsbDisk::new(usb_device, controller);
                     if try_boot_from_esp_usb(
                         &mut disk,
                         &entry.partition,
@@ -483,240 +422,9 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                     }
                 }
             }
-            log::error!("Failed to boot USB (generic) entry");
+            log::error!("Failed to boot USB entry");
         }
     }
-}
-
-/// Try to boot from NVMe
-fn try_boot_from_nvme() -> bool {
-    use drivers::storage::{self, StorageType};
-
-    if let Some(controller) = drivers::nvme::get_controller(0) {
-        log::info!("Probing NVMe controller for ESP...");
-
-        if let Some(ns) = controller.default_namespace() {
-            let nsid = ns.nsid;
-            let num_blocks = ns.num_blocks;
-            let block_size = ns.block_size;
-
-            // Store the device globally for SimpleFileSystem protocol
-            if !drivers::nvme::store_global_device(0, nsid) {
-                log::error!("Failed to store NVMe device globally");
-                return false;
-            }
-
-            // Register with storage abstraction (needed for BlockIO)
-            let storage_id = match storage::register_device(
-                StorageType::Nvme {
-                    controller_id: 0,
-                    nsid,
-                },
-                num_blocks,
-                block_size,
-            ) {
-                Some(id) => id,
-                None => {
-                    log::error!("Failed to register NVMe device with storage");
-                    return false;
-                }
-            };
-
-            // Get actual PCI address from the controller before creating disk (which borrows it)
-            let pci_addr = controller.pci_address();
-
-            let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
-
-            // Install BlockIO for all partitions and find ESP
-            if let Some((partition_num, esp)) = install_block_io_for_nvme_disk(
-                &mut disk,
-                storage_id,
-                block_size,
-                num_blocks,
-                pci_addr.device,
-                pci_addr.function,
-                nsid,
-            ) {
-                // Re-create disk since install_block_io_for_nvme_disk consumed it
-                if let Some(controller) = drivers::nvme::get_controller(0) {
-                    let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
-                    if try_boot_from_esp_nvme(
-                        &mut disk,
-                        &esp,
-                        partition_num,
-                        pci_addr.device,
-                        pci_addr.function,
-                        nsid,
-                    ) {
-                        return true;
-                    }
-                }
-            } else {
-                log::debug!("No ESP found on NVMe");
-            }
-        }
-    }
-    false
-}
-
-/// Try to boot from AHCI/SATA
-fn try_boot_from_ahci() -> bool {
-    use drivers::storage::{self, StorageType};
-
-    if let Some(controller) = drivers::ahci::get_controller(0) {
-        for port_index in 0..controller.num_active_ports() {
-            log::info!("Probing AHCI port {} for ESP...", port_index);
-
-            // Get port info (num_blocks, block_size)
-            let (num_blocks, block_size) = match controller.get_port(port_index) {
-                Some(port) => (port.sector_count, port.sector_size),
-                None => continue,
-            };
-
-            // Store the device globally for SimpleFileSystem protocol
-            if !drivers::ahci::store_global_device(0, port_index) {
-                log::error!("Failed to store AHCI device globally");
-                continue;
-            }
-
-            // Register with storage abstraction (needed for BlockIO)
-            let storage_id = match storage::register_device(
-                StorageType::Ahci {
-                    controller_id: 0,
-                    port: port_index,
-                },
-                num_blocks,
-                block_size,
-            ) {
-                Some(id) => id,
-                None => {
-                    log::error!("Failed to register AHCI device with storage");
-                    continue;
-                }
-            };
-
-            // Get PCI address before creating disk (which borrows controller)
-            let pci_addr = controller.pci_address();
-
-            let mut disk = fs::gpt::AhciDisk::new(controller, port_index);
-
-            // Install BlockIO for all partitions and find ESP
-            if let Some((partition_num, esp)) = install_block_io_for_ahci_disk(
-                &mut disk,
-                storage_id,
-                block_size,
-                num_blocks,
-                pci_addr.device,
-                pci_addr.function,
-                port_index as u16,
-            ) {
-                // Re-create disk since install_block_io_for_ahci_disk consumed it
-                if let Some(controller) = drivers::ahci::get_controller(0) {
-                    let mut disk = fs::gpt::AhciDisk::new(controller, port_index);
-                    if try_boot_from_esp_ahci(
-                        &mut disk,
-                        &esp,
-                        partition_num,
-                        pci_addr.device,
-                        pci_addr.function,
-                        port_index as u16,
-                    ) {
-                        return true;
-                    }
-                }
-            } else {
-                log::debug!("No ESP found on AHCI port {}", port_index);
-            }
-        }
-    }
-    false
-}
-
-/// Try to boot from USB mass storage
-fn try_boot_from_usb() -> bool {
-    use drivers::storage::{self, StorageType};
-
-    if let Some(xhci) = drivers::usb::get_controller(0) {
-        if let Some(slot_id) = xhci.find_mass_storage() {
-            log::info!("Found USB mass storage device on slot {}", slot_id);
-
-            // Create mass storage device
-            match drivers::usb::UsbMassStorage::new(xhci, slot_id) {
-                Ok(usb_device) => {
-                    // Get disk info before storing
-                    let num_blocks = usb_device.num_blocks;
-                    let block_size = usb_device.block_size;
-                    // TODO: Get actual USB port from device - using 0 as default for QEMU
-                    let usb_port: u8 = 0;
-
-                    // Store the device globally for later access by filesystem protocol
-                    if !drivers::usb::mass_storage::store_global_device(usb_device) {
-                        log::error!("Failed to store USB device globally");
-                        return false;
-                    }
-
-                    // Register with storage abstraction
-                    let storage_id = match storage::register_device(
-                        StorageType::Usb { slot_id },
-                        num_blocks,
-                        block_size,
-                    ) {
-                        Some(id) => id,
-                        None => {
-                            log::error!("Failed to register USB device with storage");
-                            return false;
-                        }
-                    };
-
-                    // Install BlockIO for all partitions
-                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                        if let Some(xhci) = drivers::usb::get_controller(0) {
-                            // Get actual PCI address from the xHCI controller
-                            let pci_addr = xhci.pci_address();
-                            let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
-
-                            if let Some((partition_num, esp)) = install_block_io_for_disk(
-                                &mut disk,
-                                storage_id,
-                                block_size,
-                                num_blocks,
-                                pci_addr.device,
-                                pci_addr.function,
-                                usb_port,
-                            ) {
-                                // Boot from ESP
-                                if let Some(usb_device) =
-                                    drivers::usb::mass_storage::get_global_device()
-                                {
-                                    if let Some(xhci) = drivers::usb::get_controller(0) {
-                                        let pci_addr = xhci.pci_address();
-                                        let mut disk = fs::gpt::UsbDisk::new(usb_device, xhci);
-
-                                        if try_boot_from_esp_usb(
-                                            &mut disk,
-                                            &esp,
-                                            partition_num,
-                                            pci_addr.device,
-                                            pci_addr.function,
-                                            usb_port,
-                                        ) {
-                                            return true;
-                                        }
-                                    }
-                                }
-                            } else {
-                                log::debug!("No ESP found on USB device");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to initialize USB mass storage: {:?}", e);
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Install BlockIO protocols for a disk and all its partitions
@@ -1281,43 +989,6 @@ fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
     }
 
     None
-}
-
-/// Try to boot from an ESP on a given disk (generic version)
-fn try_boot_from_esp<R: fs::gpt::SectorRead>(disk: &mut R, esp: &fs::gpt::Partition) -> bool {
-    match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
-        Ok(mut fat) => {
-            log::info!("FAT filesystem mounted on ESP");
-
-            // Look for EFI bootloader
-            let boot_path = "EFI\\BOOT\\BOOTX64.EFI";
-            match fat.file_size(boot_path) {
-                Ok(size) => {
-                    log::info!("Found bootloader: {} ({} bytes)", boot_path, size);
-
-                    // Load and execute the bootloader (no device handle)
-                    match load_and_execute_bootloader(
-                        &mut fat,
-                        boot_path,
-                        size,
-                        core::ptr::null_mut(),
-                    ) {
-                        Ok(()) => return true,
-                        Err(e) => {
-                            log::error!("Failed to execute bootloader: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Bootloader not found: {:?}", e);
-                }
-            }
-        }
-        Err(e) => {
-            log::error!("Failed to mount FAT filesystem: {:?}", e);
-        }
-    }
-    false
 }
 
 /// Try to boot from an ESP on USB (with SimpleFileSystem support)

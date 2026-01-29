@@ -8,11 +8,10 @@ use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
-use spin::Mutex;
-
 use super::controller::{desc_type, parse_configuration, req_type, request, DeviceDescriptor};
 
 /// xHCI Capability Registers
+#[allow(dead_code)]
 mod cap_regs {
     /// Capability Register Length
     pub const CAPLENGTH: u32 = 0x00;
@@ -35,6 +34,7 @@ mod cap_regs {
 }
 
 /// xHCI Operational Registers (relative to op_base)
+#[allow(dead_code)]
 mod op_regs {
     /// USB Command
     pub const USBCMD: u32 = 0x00;
@@ -53,6 +53,7 @@ mod op_regs {
 }
 
 /// USB Command bits
+#[allow(dead_code)]
 mod usbcmd {
     /// Run/Stop
     pub const RS: u32 = 1 << 0;
@@ -65,6 +66,7 @@ mod usbcmd {
 }
 
 /// USB Status bits
+#[allow(dead_code)]
 mod usbsts {
     /// Host Controller Halted
     pub const HCH: u32 = 1 << 0;
@@ -79,6 +81,7 @@ mod usbsts {
 }
 
 /// Port Register offsets (relative to port base)
+#[allow(dead_code)]
 mod port_regs {
     /// Port Status and Control
     pub const PORTSC: u32 = 0x00;
@@ -91,6 +94,7 @@ mod port_regs {
 }
 
 /// Port Status and Control bits
+#[allow(dead_code)]
 mod portsc {
     /// Current Connect Status
     pub const CCS: u32 = 1 << 0;
@@ -140,6 +144,7 @@ mod portsc {
 }
 
 /// TRB Types
+#[allow(dead_code)]
 mod trb_type {
     /// Normal TRB
     pub const NORMAL: u32 = 1;
@@ -186,6 +191,7 @@ mod trb_type {
 }
 
 /// TRB Completion Codes
+#[allow(dead_code)]
 mod trb_cc {
     pub const SUCCESS: u32 = 1;
     pub const DATA_BUFFER_ERROR: u32 = 2;
@@ -216,14 +222,6 @@ impl Trb {
 
     fn get_type(&self) -> u32 {
         (self.control >> 10) & 0x3F
-    }
-
-    fn set_cycle(&mut self, cycle: bool) {
-        if cycle {
-            self.control |= 1;
-        } else {
-            self.control &= !1;
-        }
     }
 
     fn get_cycle(&self) -> bool {
@@ -298,10 +296,6 @@ impl EndpointContext {
 
     fn set_avg_trb_length(&mut self, len: u16) {
         self.dw4 = (self.dw4 & !0x0000FFFF) | (len as u32);
-    }
-
-    fn set_interval(&mut self, interval: u8) {
-        self.dw0 = (self.dw0 & !0x00FF0000) | ((interval as u32) << 16);
     }
 }
 
@@ -448,26 +442,6 @@ impl TrbRing {
         addr
     }
 
-    fn dequeue(&mut self) -> Option<Trb> {
-        let addr = self.base + (self.dequeue_idx * 16) as u64;
-        let entry = unsafe { &*(addr as *const Trb) };
-
-        // Check if this TRB is ready (cycle bit matches)
-        if entry.get_cycle() != self.cycle {
-            return None;
-        }
-
-        let trb = *entry;
-
-        self.dequeue_idx += 1;
-        if self.dequeue_idx >= self.size - 1 {
-            self.dequeue_idx = 0;
-            self.cycle = !self.cycle;
-        }
-
-        Some(trb)
-    }
-
     fn physical_addr(&self) -> u64 {
         self.base | if self.cycle { 1 } else { 0 }
     }
@@ -511,7 +485,8 @@ pub struct UsbSlot {
 pub struct XhciController {
     /// PCI address (bus:device.function)
     pci_address: PciAddress,
-    /// MMIO base address
+    /// MMIO base address (kept for hardware completeness)
+    #[allow(dead_code)]
     mmio_base: u64,
     /// Operational registers base
     op_base: u64,
@@ -525,7 +500,8 @@ pub struct XhciController {
     num_ports: u8,
     /// Number of slots
     max_slots: u8,
-    /// Page size
+    /// Page size (kept for hardware completeness)
+    #[allow(dead_code)]
     page_size: u32,
     /// Device Context Base Address Array
     dcbaa: u64,
@@ -718,10 +694,6 @@ impl XhciController {
         unsafe { ptr::write_volatile((self.op_base + offset as u64) as *mut u32, value) }
     }
 
-    fn read_op_reg64(&self, offset: u32) -> u64 {
-        unsafe { ptr::read_volatile((self.op_base + offset as u64) as *const u64) }
-    }
-
     fn write_op_reg64(&mut self, offset: u32, value: u64) {
         unsafe { ptr::write_volatile((self.op_base + offset as u64) as *mut u64, value) }
     }
@@ -739,11 +711,6 @@ impl XhciController {
     fn ring_doorbell(&self, slot: u8, target: u8) {
         let addr = self.db_base + (slot as u64 * 4);
         unsafe { ptr::write_volatile(addr as *mut u32, target as u32) }
-    }
-
-    fn read_interrupter_reg(&self, offset: u32) -> u32 {
-        let addr = self.rt_base + 0x20 + offset as u64; // Interrupter 0
-        unsafe { ptr::read_volatile(addr as *const u32) }
     }
 
     fn write_interrupter_reg(&mut self, offset: u32, value: u32) {
@@ -1604,90 +1571,6 @@ impl XhciController {
         }
 
         log::debug!("xHCI cleanup complete");
-    }
-}
-
-/// Wrapper for xHCI controller pointer to implement Send
-struct XhciControllerPtr(*mut XhciController);
-
-// SAFETY: We ensure single-threaded access via the Mutex
-unsafe impl Send for XhciControllerPtr {}
-
-/// Global list of xHCI controllers
-static XHCI_CONTROLLERS: Mutex<heapless::Vec<XhciControllerPtr, 4>> =
-    Mutex::new(heapless::Vec::new());
-
-/// Initialize xHCI controllers
-pub fn init() {
-    log::info!("Initializing xHCI controllers...");
-
-    // Find xHCI controllers (class 0x0C, subclass 0x03, prog_if 0x30)
-    let devices = pci::get_all_devices();
-    let mut xhci_count = 0;
-
-    let mut controllers = XHCI_CONTROLLERS.lock();
-
-    for dev in devices.iter() {
-        if dev.class_code == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
-            log::info!(
-                "Found xHCI controller at {}: {:04x}:{:04x}",
-                dev.address,
-                dev.vendor_id,
-                dev.device_id
-            );
-
-            match XhciController::new(dev) {
-                Ok(controller) => {
-                    // Calculate required pages: XhciController contains
-                    // slots: [Option<UsbSlot>; 4] where UsbSlot contains transfer_rings
-                    let size = core::mem::size_of::<XhciController>();
-                    let pages = (size + 4095) / 4096;
-                    log::debug!(
-                        "xHCI: Allocating {} pages ({} bytes) for XhciController",
-                        pages,
-                        size
-                    );
-                    let controller_ptr = efi::allocate_pages(pages as u64);
-                    if let Some(ptr) = controller_ptr {
-                        let controller_box = ptr as *mut XhciController;
-                        unsafe {
-                            ptr::write(controller_box, controller);
-                        }
-                        let _ = controllers.push(XhciControllerPtr(controller_box));
-                        xhci_count += 1;
-                        log::info!("xHCI controller at {} initialized", dev.address);
-                    }
-                }
-                Err(e) => {
-                    log::error!(
-                        "Failed to initialize xHCI controller at {}: {:?}",
-                        dev.address,
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    log::info!("xHCI initialization complete: {} controllers", xhci_count);
-}
-
-/// Get an xHCI controller
-pub fn get_controller(index: usize) -> Option<&'static mut XhciController> {
-    let controllers = XHCI_CONTROLLERS.lock();
-    controllers.get(index).map(|ptr| unsafe { &mut *ptr.0 })
-}
-
-/// Clean up all xHCI controllers from the legacy init path
-///
-/// This is called from usb::cleanup() to ensure controllers initialized
-/// via xhci::init() are also cleaned up.
-pub fn cleanup() {
-    let controllers = XHCI_CONTROLLERS.lock();
-
-    for ptr in controllers.iter() {
-        let controller = unsafe { &mut *ptr.0 };
-        controller.cleanup();
     }
 }
 

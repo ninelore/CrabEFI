@@ -128,7 +128,6 @@ pub fn read_sectors(device_id: u32, lba: u64, buffer: &mut [u8]) -> Result<(), (
 ///
 /// Returns a function pointer that can be used with BlockIO.
 /// Note: This is a placeholder - the actual device_id is stored in BlockIO context.
-#[allow(dead_code)]
 pub fn make_read_fn(_device_id: u32) -> fn(u64, &mut [u8]) -> Result<(), ()> {
     // We need to capture the device_id, but fn pointers can't capture.
     // Instead, we'll use the device_id embedded in the BlockIO context.

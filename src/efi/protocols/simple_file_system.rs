@@ -25,9 +25,6 @@ const MAX_PATH_LEN: usize = 256;
 /// Maximum number of open file handles
 const MAX_FILE_HANDLES: usize = 32;
 
-/// Maximum directory entries to cache
-const MAX_DIR_ENTRIES: usize = 64;
-
 /// File open modes
 pub const FILE_MODE_READ: u64 = efi_file::MODE_READ;
 pub const FILE_MODE_WRITE: u64 = efi_file::MODE_WRITE;
@@ -179,17 +176,6 @@ extern "efiapi" fn sfs_open_volume(
 // ============================================================================
 // File Protocol Functions
 // ============================================================================
-
-/// Find the handle index from a protocol pointer
-fn find_handle_index(protocol: *mut efi_file::Protocol) -> Option<usize> {
-    let handles = FILE_HANDLES.lock();
-    for (i, h) in handles.iter().enumerate() {
-        if h.in_use && core::ptr::eq(&h.protocol as *const _, protocol as *const _) {
-            return Some(i);
-        }
-    }
-    None
-}
 
 extern "efiapi" fn file_open(
     this: *mut efi_file::Protocol,

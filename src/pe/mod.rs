@@ -18,11 +18,6 @@ const PE32_PLUS_MAGIC: u16 = 0x020B;
 /// Machine type: AMD64
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 
-/// Section characteristics
-const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
-const IMAGE_SCN_MEM_READ: u32 = 0x40000000;
-const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000;
-
 /// Relocation types
 const IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
 const IMAGE_REL_BASED_DIR64: u16 = 10;

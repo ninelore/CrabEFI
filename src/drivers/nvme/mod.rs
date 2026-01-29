@@ -11,6 +11,7 @@ use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 
 /// NVMe controller registers (MMIO base offsets)
+#[allow(dead_code)]
 mod regs {
     pub const CAP: u64 = 0x00; // Controller Capabilities
     pub const VS: u64 = 0x08; // Version
@@ -25,6 +26,7 @@ mod regs {
 }
 
 /// NVMe admin commands
+#[allow(dead_code)]
 mod admin_cmd {
     pub const DELETE_SQ: u8 = 0x00;
     pub const CREATE_SQ: u8 = 0x01;
@@ -39,6 +41,7 @@ mod admin_cmd {
 }
 
 /// NVMe I/O commands
+#[allow(dead_code)]
 mod io_cmd {
     pub const FLUSH: u8 = 0x00;
     pub const WRITE: u8 = 0x01;
@@ -48,12 +51,6 @@ mod io_cmd {
 /// Queue sizes (must be power of 2)
 const ADMIN_QUEUE_SIZE: usize = 16;
 const IO_QUEUE_SIZE: usize = 64;
-
-/// Sector size (for standard NVMe namespace)
-const SECTOR_SIZE: usize = 512;
-
-/// Maximum data transfer size per command
-const MAX_TRANSFER_SIZE: usize = 4096 * 256; // 1MB
 
 /// NVMe Submission Queue Entry (64 bytes)
 #[repr(C, align(64))]
@@ -448,11 +445,6 @@ impl NvmeController {
     /// Write a 32-bit register
     fn write_reg32(&mut self, offset: u64, value: u32) {
         unsafe { ptr::write_volatile((self.mmio_base + offset) as *mut u32, value) }
-    }
-
-    /// Read a 64-bit register
-    fn read_reg64(&self, offset: u64) -> u64 {
-        unsafe { ptr::read_volatile((self.mmio_base + offset) as *const u64) }
     }
 
     /// Write a 64-bit register

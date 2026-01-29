@@ -187,35 +187,12 @@ impl DirectoryEntry {
     }
 }
 
-/// FAT long filename entry
-#[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
-struct LfnEntry {
-    /// Sequence number
-    seq: u8,
-    /// Characters 1-5 (UTF-16LE)
-    name1: [u16; 5],
-    /// Attributes (always 0x0F)
-    attr: u8,
-    /// Type (always 0x00)
-    entry_type: u8,
-    /// Checksum
-    checksum: u8,
-    /// Characters 6-11 (UTF-16LE)
-    name2: [u16; 6],
-    /// First cluster (always 0)
-    first_cluster: u16,
-    /// Characters 12-13 (UTF-16LE)
-    name3: [u16; 2],
-}
-
 /// Directory entry attributes
 const ATTR_READ_ONLY: u8 = 0x01;
 const ATTR_HIDDEN: u8 = 0x02;
 const ATTR_SYSTEM: u8 = 0x04;
 const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
-const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_LFN: u8 = ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_VOLUME_ID;
 
 /// FAT filesystem type
@@ -263,7 +240,8 @@ pub struct FatFilesystem<'a, R: SectorRead> {
     sectors_per_cluster: u8,
     /// First FAT sector (relative to partition start)
     fat_start: u32,
-    /// Sectors per FAT
+    /// Sectors per FAT (kept for filesystem completeness)
+    #[allow(dead_code)]
     sectors_per_fat: u32,
     /// First data sector (relative to partition start)
     data_start: u32,
@@ -273,7 +251,8 @@ pub struct FatFilesystem<'a, R: SectorRead> {
     root_dir_start: u32,
     /// Root directory sector count (FAT12/16 only)
     root_dir_sectors: u32,
-    /// Total data clusters
+    /// Total data clusters (kept for filesystem completeness)
+    #[allow(dead_code)]
     data_clusters: u32,
 }
 

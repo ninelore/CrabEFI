@@ -7,11 +7,11 @@
 //! `UsbController` trait (xHCI, EHCI, OHCI, UHCI).
 
 use super::controller::{UsbController, UsbError};
-use super::xhci::XhciController;
 use crate::time;
 use core::ptr;
 
 /// SCSI Commands
+#[allow(dead_code)]
 mod scsi_cmd {
     pub const TEST_UNIT_READY: u8 = 0x00;
     pub const REQUEST_SENSE: u8 = 0x03;
@@ -114,7 +114,8 @@ pub struct UsbMassStorage {
     bulk_in: u8,
     /// Bulk OUT endpoint number
     bulk_out: u8,
-    /// Maximum packet size
+    /// Maximum packet size (kept for hardware completeness)
+    #[allow(dead_code)]
     max_packet: u16,
     /// LUN
     lun: u8,
@@ -159,7 +160,7 @@ impl UsbMassStorage {
     /// # Arguments
     /// * `controller` - Any USB controller implementing the UsbController trait
     /// * `device_addr` - Device address (slot ID for xHCI, device address for others)
-    pub fn new_generic(
+    pub fn new(
         controller: &mut dyn UsbController,
         device_addr: u8,
     ) -> Result<Self, MassStorageError> {
@@ -191,18 +192,13 @@ impl UsbMassStorage {
         };
 
         // Initialize the device
-        device.init_generic(controller)?;
+        device.init(controller)?;
 
         Ok(device)
     }
 
-    /// Create a new USB mass storage device (xHCI-specific, for backwards compatibility)
-    pub fn new(controller: &mut XhciController, slot_id: u8) -> Result<Self, MassStorageError> {
-        Self::new_generic(controller, slot_id)
-    }
-
-    /// Initialize the device (generic version)
-    fn init_generic(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
+    /// Initialize the device
+    fn init(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
         // Test Unit Ready (may need multiple attempts as device spins up)
         for _ in 0..5 {
             if self.test_unit_ready(controller).is_ok() {
@@ -505,16 +501,19 @@ unsafe impl Send for GlobalUsbState {}
 /// Global USB mass storage device and controller
 static GLOBAL_USB_STATE: Mutex<Option<GlobalUsbState>> = Mutex::new(None);
 
-/// Store a USB mass storage device globally (xHCI legacy path)
+/// Store a USB mass storage device globally
 ///
 /// This takes ownership of the device and stores it for later use by the
-/// filesystem protocol. Uses xhci::get_controller(0) for the controller.
-pub fn store_global_device(device: UsbMassStorage) -> bool {
-    // Get the xHCI controller pointer for the legacy path
-    let controller_ptr = match super::xhci::get_controller(0) {
-        Some(c) => c as *mut dyn UsbController,
+/// filesystem protocol. Uses the controller at the specified index.
+pub fn store_global_device(device: UsbMassStorage, controller_index: usize) -> bool {
+    // Get the controller pointer from ALL_CONTROLLERS
+    let controller_ptr = match super::get_controller_ptr(controller_index) {
+        Some(c) => c,
         None => {
-            log::error!("Failed to get xHCI controller for global device");
+            log::error!(
+                "Failed to get USB controller {} for global device",
+                controller_index
+            );
             return false;
         }
     };

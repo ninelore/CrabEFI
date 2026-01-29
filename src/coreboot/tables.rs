@@ -11,6 +11,7 @@ use heapless::Vec;
 const MAX_MEMORY_REGIONS: usize = 64;
 
 /// Coreboot table tags
+#[allow(dead_code)]
 mod tags {
     pub const CB_TAG_UNUSED: u32 = 0x0000;
     pub const CB_TAG_MEMORY: u32 = 0x0001;

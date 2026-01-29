@@ -84,11 +84,14 @@ pub struct UsbHidKeyboard {
     controller_idx: usize,
     /// Device address
     device_address: u8,
-    /// Interrupt endpoint number
+    /// Interrupt endpoint number (kept for hardware completeness)
+    #[allow(dead_code)]
     endpoint: u8,
-    /// Max packet size
+    /// Max packet size (kept for hardware completeness)
+    #[allow(dead_code)]
     max_packet: u16,
-    /// Polling interval (ms)
+    /// Polling interval (ms, kept for hardware completeness)
+    #[allow(dead_code)]
     interval: u8,
     /// Previous report (for detecting changes)
     prev_report: KeyboardReport,
@@ -640,14 +643,18 @@ pub fn init_keyboard<C: UsbController>(
     );
 
     // Set boot protocol
+    log::debug!("Setting boot protocol for keyboard device {}", device_addr);
     if let Err(e) = keyboard.set_boot_protocol(controller) {
         log::warn!("Failed to set boot protocol: {:?}", e);
     }
+    log::debug!("Boot protocol set");
 
     // Set idle rate (30ms)
+    log::debug!("Setting idle rate");
     if let Err(e) = keyboard.set_idle(controller, 30) {
         log::warn!("Failed to set idle rate: {:?}", e);
     }
+    log::debug!("Idle rate set");
 
     *USB_KEYBOARD.lock() = Some(keyboard);
 
