@@ -2,8 +2,12 @@
 //!
 //! This module implements the USB Mass Storage Class Bulk-Only Transport (BBB)
 //! protocol with SCSI command set for reading from USB drives.
+//!
+//! This driver works with any USB host controller that implements the
+//! `UsbController` trait (xHCI, EHCI, OHCI, UHCI).
 
-use super::xhci::{XhciController, XhciError};
+use super::controller::{UsbController, UsbError};
+use super::xhci::XhciController;
 use crate::time;
 use core::ptr;
 
@@ -104,11 +108,11 @@ pub struct ReadCapacity10Response {
 
 /// USB Mass Storage Device
 pub struct UsbMassStorage {
-    /// Slot ID
-    slot_id: u8,
-    /// Bulk IN endpoint
+    /// Device address (slot ID for xHCI, device address for EHCI/OHCI/UHCI)
+    device_addr: u8,
+    /// Bulk IN endpoint number
     bulk_in: u8,
-    /// Bulk OUT endpoint
+    /// Bulk OUT endpoint number
     bulk_out: u8,
     /// Maximum packet size
     max_packet: u16,
@@ -129,8 +133,8 @@ pub struct UsbMassStorage {
 /// Mass Storage Error
 #[derive(Debug)]
 pub enum MassStorageError {
-    /// xHCI error
-    Xhci(XhciError),
+    /// USB transfer error
+    Usb(UsbError),
     /// Invalid CSW
     InvalidCsw,
     /// Command failed
@@ -143,28 +147,41 @@ pub enum MassStorageError {
     InvalidParameter,
 }
 
-impl From<XhciError> for MassStorageError {
-    fn from(e: XhciError) -> Self {
-        MassStorageError::Xhci(e)
+impl From<UsbError> for MassStorageError {
+    fn from(e: UsbError) -> Self {
+        MassStorageError::Usb(e)
     }
 }
 
 impl UsbMassStorage {
-    /// Create a new USB mass storage device
-    pub fn new(controller: &mut XhciController, slot_id: u8) -> Result<Self, MassStorageError> {
-        let slot = controller
-            .get_slot(slot_id)
+    /// Create a new USB mass storage device from any USB controller
+    ///
+    /// # Arguments
+    /// * `controller` - Any USB controller implementing the UsbController trait
+    /// * `device_addr` - Device address (slot ID for xHCI, device address for others)
+    pub fn new_generic(
+        controller: &mut dyn UsbController,
+        device_addr: u8,
+    ) -> Result<Self, MassStorageError> {
+        // Get device info to verify it's a mass storage device
+        let device_info = controller
+            .get_device_info(device_addr)
             .ok_or(MassStorageError::NotReady)?;
 
-        if !slot.is_mass_storage {
+        if !device_info.is_mass_storage {
             return Err(MassStorageError::NotReady);
         }
 
+        // Get bulk endpoint info
+        let (bulk_in_ep, bulk_out_ep) = controller
+            .get_bulk_endpoints(device_addr)
+            .ok_or(MassStorageError::NotReady)?;
+
         let mut device = Self {
-            slot_id,
-            bulk_in: slot.bulk_in_ep,
-            bulk_out: slot.bulk_out_ep,
-            max_packet: slot.bulk_max_packet,
+            device_addr,
+            bulk_in: bulk_in_ep.number,
+            bulk_out: bulk_out_ep.number,
+            max_packet: bulk_in_ep.max_packet_size,
             lun: 0,
             tag: 1,
             num_blocks: 0,
@@ -174,13 +191,18 @@ impl UsbMassStorage {
         };
 
         // Initialize the device
-        device.init(controller)?;
+        device.init_generic(controller)?;
 
         Ok(device)
     }
 
-    /// Initialize the device
-    fn init(&mut self, controller: &mut XhciController) -> Result<(), MassStorageError> {
+    /// Create a new USB mass storage device (xHCI-specific, for backwards compatibility)
+    pub fn new(controller: &mut XhciController, slot_id: u8) -> Result<Self, MassStorageError> {
+        Self::new_generic(controller, slot_id)
+    }
+
+    /// Initialize the device (generic version)
+    fn init_generic(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
         // Test Unit Ready (may need multiple attempts as device spins up)
         for _ in 0..5 {
             if self.test_unit_ready(controller).is_ok() {
@@ -215,10 +237,10 @@ impl UsbMassStorage {
         tag
     }
 
-    /// Send a SCSI command
+    /// Send a SCSI command (generic version for any UsbController)
     fn scsi_command(
         &mut self,
-        controller: &mut XhciController,
+        controller: &mut dyn UsbController,
         cdb: &[u8],
         data: Option<&mut [u8]>,
         is_read: bool,
@@ -240,12 +262,12 @@ impl UsbMassStorage {
         let mut cbw_buf = [0u8; 31];
         cbw_buf.copy_from_slice(cbw_bytes);
 
-        controller.bulk_transfer(self.slot_id, self.bulk_out, false, &mut cbw_buf)?;
+        controller.bulk_transfer(self.device_addr, self.bulk_out, false, &mut cbw_buf)?;
 
         // Data phase (if any)
         let transferred = if let Some(buf) = data {
             controller.bulk_transfer(
-                self.slot_id,
+                self.device_addr,
                 if is_read { self.bulk_in } else { self.bulk_out },
                 is_read,
                 buf,
@@ -256,7 +278,7 @@ impl UsbMassStorage {
 
         // Receive CSW (IN)
         let mut csw_buf = [0u8; 13];
-        controller.bulk_transfer(self.slot_id, self.bulk_in, true, &mut csw_buf)?;
+        controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)?;
 
         let csw = unsafe { ptr::read_unaligned(csw_buf.as_ptr() as *const CommandStatusWrapper) };
 
@@ -278,14 +300,17 @@ impl UsbMassStorage {
     }
 
     /// Test Unit Ready command
-    fn test_unit_ready(&mut self, controller: &mut XhciController) -> Result<(), MassStorageError> {
+    fn test_unit_ready(
+        &mut self,
+        controller: &mut dyn UsbController,
+    ) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::TEST_UNIT_READY, 0, 0, 0, 0, 0];
         self.scsi_command(controller, &cdb, None, false)?;
         Ok(())
     }
 
     /// Inquiry command
-    fn inquiry(&mut self, controller: &mut XhciController) -> Result<(), MassStorageError> {
+    fn inquiry(&mut self, controller: &mut dyn UsbController) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::INQUIRY, 0, 0, 0, 36, 0]; // Request 36 bytes
         let mut response = [0u8; 36];
 
@@ -300,7 +325,10 @@ impl UsbMassStorage {
     }
 
     /// Read Capacity command
-    fn read_capacity(&mut self, controller: &mut XhciController) -> Result<(), MassStorageError> {
+    fn read_capacity(
+        &mut self,
+        controller: &mut dyn UsbController,
+    ) -> Result<(), MassStorageError> {
         let cdb = [scsi_cmd::READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut response = [0u8; 8];
 
@@ -327,7 +355,7 @@ impl UsbMassStorage {
     /// Read Capacity 16 command (for large drives)
     fn read_capacity_16(
         &mut self,
-        controller: &mut XhciController,
+        controller: &mut dyn UsbController,
     ) -> Result<(), MassStorageError> {
         let mut cdb = [0u8; 16];
         cdb[0] = scsi_cmd::READ_CAPACITY_16;
@@ -356,10 +384,10 @@ impl UsbMassStorage {
         Ok(())
     }
 
-    /// Read sectors from the device
-    pub fn read_sectors(
+    /// Read sectors from the device (generic version)
+    pub fn read_sectors_generic(
         &mut self,
-        controller: &mut XhciController,
+        controller: &mut dyn UsbController,
         start_lba: u64,
         num_sectors: u32,
         buffer: &mut [u8],
@@ -376,10 +404,21 @@ impl UsbMassStorage {
         }
     }
 
+    /// Read sectors from the device (xHCI-specific, for backwards compatibility)
+    pub fn read_sectors(
+        &mut self,
+        controller: &mut XhciController,
+        start_lba: u64,
+        num_sectors: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), MassStorageError> {
+        self.read_sectors_generic(controller, start_lba, num_sectors, buffer)
+    }
+
     /// READ(10) command
     fn read_10(
         &mut self,
-        controller: &mut XhciController,
+        controller: &mut dyn UsbController,
         lba: u32,
         count: u16,
         buffer: &mut [u8],
@@ -409,7 +448,7 @@ impl UsbMassStorage {
     /// READ(16) command (for large LBAs)
     fn read_16(
         &mut self,
-        controller: &mut XhciController,
+        controller: &mut dyn UsbController,
         lba: u64,
         count: u32,
         buffer: &mut [u8],
@@ -442,9 +481,14 @@ impl UsbMassStorage {
         Ok(())
     }
 
-    /// Get the slot ID
+    /// Get the device address (slot ID for xHCI, device address for others)
+    pub fn device_addr(&self) -> u8 {
+        self.device_addr
+    }
+
+    /// Get the slot ID (alias for device_addr, for backwards compatibility)
     pub fn slot_id(&self) -> u8 {
-        self.slot_id
+        self.device_addr
     }
 }
 
@@ -461,14 +505,25 @@ struct UsbMassStoragePtr(*mut UsbMassStorage);
 // Safety: We use mutex protection for all access
 unsafe impl Send for UsbMassStoragePtr {}
 
-/// Global USB mass storage device
+/// Global USB mass storage device and its controller ID
 static GLOBAL_USB_DEVICE: Mutex<Option<UsbMassStoragePtr>> = Mutex::new(None);
+
+/// Controller ID for the global device (None = xHCI legacy, Some(id) = generic)
+static GLOBAL_CONTROLLER_ID: Mutex<Option<usize>> = Mutex::new(None);
 
 /// Store a USB mass storage device globally
 ///
 /// This takes ownership of the device and stores it for later use by the
 /// filesystem protocol.
 pub fn store_global_device(device: UsbMassStorage) -> bool {
+    store_global_device_with_controller(device, None)
+}
+
+/// Store a USB mass storage device globally with a specific controller ID
+pub fn store_global_device_with_controller(
+    device: UsbMassStorage,
+    controller_id: Option<usize>,
+) -> bool {
     // Allocate memory for the device
     let size = core::mem::size_of::<UsbMassStorage>();
     let pages = (size + 4095) / 4096;
@@ -480,7 +535,11 @@ pub fn store_global_device(device: UsbMassStorage) -> bool {
         }
 
         *GLOBAL_USB_DEVICE.lock() = Some(UsbMassStoragePtr(device_ptr));
-        log::info!("USB mass storage device stored globally");
+        *GLOBAL_CONTROLLER_ID.lock() = controller_id;
+        log::info!(
+            "USB mass storage device stored globally (controller: {:?})",
+            controller_id
+        );
         true
     } else {
         log::error!("Failed to allocate memory for global USB device");
@@ -500,28 +559,57 @@ pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
 ///
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    // Get the device
-    let device = match GLOBAL_USB_DEVICE.lock().as_ref() {
-        Some(ptr) => unsafe { &mut *ptr.0 },
-        None => {
-            log::error!("global_read_sector: no device stored");
-            return Err(());
+    log::trace!("global_read_sector: LBA={}", lba);
+
+    // Get the device - use a scope to release lock immediately
+    let device_ptr = {
+        let guard = GLOBAL_USB_DEVICE.lock();
+        match guard.as_ref() {
+            Some(ptr) => ptr.0,
+            None => {
+                log::error!("global_read_sector: no device stored");
+                return Err(());
+            }
         }
     };
+    let device = unsafe { &mut *device_ptr };
 
-    // Get the xHCI controller
-    let controller = match super::get_controller(0) {
-        Some(c) => c,
+    // Get the controller ID
+    let controller_id = *GLOBAL_CONTROLLER_ID.lock();
+    log::debug!("global_read_sector: controller_id={:?}", controller_id);
+
+    match controller_id {
+        // Legacy path: use xHCI controller 0
         None => {
-            log::error!("global_read_sector: no xHCI controller");
-            return Err(());
+            let controller = match super::get_controller(0) {
+                Some(c) => c,
+                None => {
+                    log::error!("global_read_sector: no xHCI controller");
+                    return Err(());
+                }
+            };
+            device
+                .read_sectors(controller, lba, 1, buffer)
+                .map_err(|e| {
+                    log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+                })
         }
-    };
-
-    // Read the sector
-    device
-        .read_sectors(controller, lba, 1, buffer)
-        .map_err(|e| {
-            log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
-        })
+        // Generic path: use controller by ID
+        Some(id) => {
+            log::debug!("global_read_sector: using generic path, controller {}", id);
+            let result = super::with_controller(id, |controller| {
+                log::debug!("global_read_sector: got controller, calling read_sectors_generic");
+                device
+                    .read_sectors_generic(controller, lba, 1, buffer)
+                    .map_err(|e| {
+                        log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
+                    })
+            });
+            log::debug!("global_read_sector: with_controller returned");
+            result.unwrap_or_else(|| {
+                log::error!("global_read_sector: controller {} not found", id);
+                Err(())
+            })
+        }
+    }
 }

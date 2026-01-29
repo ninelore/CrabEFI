@@ -188,7 +188,7 @@ extern "efiapi" fn block_io_read_blocks(
         return Status::INVALID_PARAMETER;
     }
 
-    log::debug!(
+    log::trace!(
         "BlockIO.ReadBlocks(media={}, lba={}, blocks={}, size={})",
         ctx.media_id,
         lba,

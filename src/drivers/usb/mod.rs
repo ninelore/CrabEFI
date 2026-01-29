@@ -17,7 +17,7 @@
 //! All host controllers implement the `UsbController` trait from the `core`
 //! module, allowing device class drivers to work with any controller type.
 
-pub mod core;
+pub mod controller;
 pub mod ehci;
 pub mod hid_keyboard;
 pub mod mass_storage;
@@ -25,7 +25,7 @@ pub mod ohci;
 pub mod uhci;
 pub mod xhci;
 
-pub use self::core::{DeviceInfo, UsbController, UsbError, UsbSpeed};
+pub use self::controller::{DeviceInfo, UsbController, UsbError, UsbSpeed};
 pub use mass_storage::UsbMassStorage;
 pub use xhci::{get_controller, XhciController, XhciError};
 
@@ -33,9 +33,8 @@ use crate::drivers::pci;
 use crate::efi;
 use spin::Mutex;
 
-// Re-import from standard library (use :: prefix to avoid conflict with our core module)
-use ::core::mem;
-use ::core::ptr;
+use core::mem;
+use core::ptr;
 
 // ============================================================================
 // Controller Type Abstraction
@@ -418,16 +417,16 @@ impl UsbController for XhciController {
         value: u16,
         index: u16,
         data: Option<&mut [u8]>,
-    ) -> Result<usize, self::core::UsbError> {
+    ) -> Result<usize, self::controller::UsbError> {
         // Call the xHCI-specific control transfer via inherent method
         // Convert XhciError to UsbError
         let result =
             xhci::do_control_transfer(self, device, request_type, request, value, index, data);
         result.map_err(|e| match e {
-            XhciError::Timeout => self::core::UsbError::Timeout,
-            XhciError::StallError => self::core::UsbError::Stall,
-            XhciError::DeviceNotFound => self::core::UsbError::DeviceNotFound,
-            _ => self::core::UsbError::TransactionError,
+            XhciError::Timeout => self::controller::UsbError::Timeout,
+            XhciError::StallError => self::controller::UsbError::Stall,
+            XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
+            _ => self::controller::UsbError::TransactionError,
         })
     }
 
@@ -437,13 +436,13 @@ impl UsbController for XhciController {
         endpoint: u8,
         is_in: bool,
         data: &mut [u8],
-    ) -> Result<usize, self::core::UsbError> {
+    ) -> Result<usize, self::controller::UsbError> {
         let result = xhci::do_bulk_transfer(self, device, endpoint, is_in, data);
         result.map_err(|e| match e {
-            XhciError::Timeout => self::core::UsbError::Timeout,
-            XhciError::StallError => self::core::UsbError::Stall,
-            XhciError::DeviceNotFound => self::core::UsbError::DeviceNotFound,
-            _ => self::core::UsbError::TransactionError,
+            XhciError::Timeout => self::controller::UsbError::Timeout,
+            XhciError::StallError => self::controller::UsbError::Stall,
+            XhciError::DeviceNotFound => self::controller::UsbError::DeviceNotFound,
+            _ => self::controller::UsbError::TransactionError,
         })
     }
 
@@ -454,9 +453,9 @@ impl UsbController for XhciController {
         _is_in: bool,
         _max_packet: u16,
         _interval: u8,
-    ) -> Result<u32, self::core::UsbError> {
+    ) -> Result<u32, self::controller::UsbError> {
         // TODO: Implement interrupt queue support for xHCI
-        Err(self::core::UsbError::NotReady)
+        Err(self::controller::UsbError::NotReady)
     }
 
     fn poll_interrupt_queue(&mut self, _queue: u32, _data: &mut [u8]) -> Option<usize> {
@@ -481,12 +480,12 @@ impl UsbController for XhciController {
         None
     }
 
-    fn get_device_info(&self, device: u8) -> Option<self::core::DeviceInfo> {
+    fn get_device_info(&self, device: u8) -> Option<self::controller::DeviceInfo> {
         let slot = self.get_slot(device)?;
-        Some(self::core::DeviceInfo {
+        Some(self::controller::DeviceInfo {
             address: device,
-            speed: self::core::UsbSpeed::from_xhci(slot.speed)
-                .unwrap_or(self::core::UsbSpeed::High),
+            speed: self::controller::UsbSpeed::from_xhci(slot.speed)
+                .unwrap_or(self::controller::UsbSpeed::High),
             vendor_id: slot.device_desc.vendor_id,
             product_id: slot.device_desc.product_id,
             device_class: slot.device_desc.device_class,
@@ -499,25 +498,28 @@ impl UsbController for XhciController {
     fn get_bulk_endpoints(
         &self,
         device: u8,
-    ) -> Option<(self::core::EndpointInfo, self::core::EndpointInfo)> {
+    ) -> Option<(
+        self::controller::EndpointInfo,
+        self::controller::EndpointInfo,
+    )> {
         let slot = self.get_slot(device)?;
         if !slot.is_mass_storage {
             return None;
         }
 
-        let bulk_in = self::core::EndpointInfo {
+        let bulk_in = self::controller::EndpointInfo {
             number: slot.bulk_in_ep,
-            direction: self::core::Direction::In,
-            transfer_type: self::core::EndpointType::Bulk,
+            direction: self::controller::Direction::In,
+            transfer_type: self::controller::EndpointType::Bulk,
             max_packet_size: slot.bulk_max_packet,
             interval: 0,
             toggle: false,
         };
 
-        let bulk_out = self::core::EndpointInfo {
+        let bulk_out = self::controller::EndpointInfo {
             number: slot.bulk_out_ep,
-            direction: self::core::Direction::Out,
-            transfer_type: self::core::EndpointType::Bulk,
+            direction: self::controller::Direction::Out,
+            transfer_type: self::controller::EndpointType::Bulk,
             max_packet_size: slot.bulk_max_packet,
             interval: 0,
             toggle: false,
@@ -526,16 +528,16 @@ impl UsbController for XhciController {
         Some((bulk_in, bulk_out))
     }
 
-    fn get_interrupt_endpoint(&self, device: u8) -> Option<self::core::EndpointInfo> {
+    fn get_interrupt_endpoint(&self, device: u8) -> Option<self::controller::EndpointInfo> {
         let slot = self.get_slot(device)?;
         if !slot.is_hid_keyboard || slot.interrupt_in_ep == 0 {
             return None;
         }
 
-        Some(self::core::EndpointInfo {
+        Some(self::controller::EndpointInfo {
             number: slot.interrupt_in_ep,
-            direction: self::core::Direction::In,
-            transfer_type: self::core::EndpointType::Interrupt,
+            direction: self::controller::Direction::In,
+            transfer_type: self::controller::EndpointType::Interrupt,
             max_packet_size: slot.interrupt_max_packet,
             interval: slot.interrupt_interval,
             toggle: false,

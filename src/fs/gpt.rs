@@ -411,9 +411,9 @@ pub fn find_esp_on_ahci(
     find_esp(&mut disk)
 }
 
-use crate::drivers::usb::{UsbMassStorage, XhciController};
+use crate::drivers::usb::{UsbController, UsbMassStorage, XhciController};
 
-/// Wrapper around USB mass storage for SectorRead trait
+/// Wrapper around USB mass storage for SectorRead trait (xHCI-specific)
 pub struct UsbDisk<'a> {
     device: &'a mut UsbMassStorage,
     controller: &'a mut XhciController,
@@ -446,5 +446,41 @@ pub fn find_esp_on_usb(
     controller: &mut XhciController,
 ) -> Result<Partition, GptError> {
     let mut disk = UsbDisk::new(device, controller);
+    find_esp(&mut disk)
+}
+
+/// Generic wrapper around USB mass storage for any controller type
+pub struct GenericUsbDisk<'a> {
+    device: &'a mut UsbMassStorage,
+    controller: &'a mut dyn UsbController,
+}
+
+impl<'a> GenericUsbDisk<'a> {
+    pub fn new(device: &'a mut UsbMassStorage, controller: &'a mut dyn UsbController) -> Self {
+        Self { device, controller }
+    }
+}
+
+impl<'a> SectorRead for GenericUsbDisk<'a> {
+    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
+        if buffer.len() < SECTOR_SIZE {
+            return Err(GptError::BufferTooSmall);
+        }
+
+        self.device
+            .read_sectors_generic(self.controller, lba, 1, buffer)
+            .map_err(|e| {
+                log::debug!("USB read_sector failed at LBA {}: {:?}", lba, e);
+                GptError::ReadError
+            })
+    }
+}
+
+/// Find ESP on a USB mass storage device using any controller
+pub fn find_esp_on_usb_generic(
+    device: &mut UsbMassStorage,
+    controller: &mut dyn UsbController,
+) -> Result<Partition, GptError> {
+    let mut disk = GenericUsbDisk::new(device, controller);
     find_esp(&mut disk)
 }

@@ -41,8 +41,13 @@ pub enum DeviceType {
     Nvme { controller_id: usize, nsid: u32 },
     /// AHCI/SATA disk
     Ahci { controller_id: usize, port: usize },
-    /// USB mass storage
+    /// USB mass storage (xHCI)
     Usb { slot_id: u8 },
+    /// USB mass storage (any controller type)
+    UsbGeneric {
+        controller_id: usize,
+        device_addr: u8,
+    },
 }
 
 impl DeviceType {
@@ -51,7 +56,7 @@ impl DeviceType {
         match self {
             DeviceType::Nvme { .. } => "NVMe",
             DeviceType::Ahci { .. } => "SATA",
-            DeviceType::Usb { .. } => "USB",
+            DeviceType::Usb { .. } | DeviceType::UsbGeneric { .. } => "USB",
         }
     }
 }
@@ -321,6 +326,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 fn discover_usb_entries(menu: &mut BootMenu) {
     use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
 
+    // First try xHCI (legacy path for backwards compatibility)
     if let Some(xhci) = usb::get_controller(0) {
         let pci_addr = xhci.pci_address();
 
@@ -381,10 +387,101 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                             }
                         }
                     }
+                    // If we found entries from xHCI, return
+                    if menu.entry_count() > 0 {
+                        return;
+                    }
                 }
                 Err(_) => {}
             }
         }
+    }
+
+    // Try other USB controllers (EHCI, OHCI, UHCI) using the generic path
+    discover_usb_entries_generic(menu);
+}
+
+/// Discover boot entries from non-xHCI USB controllers
+fn discover_usb_entries_generic(menu: &mut BootMenu) {
+    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
+
+    // Check if we have any mass storage on any controller
+    if let Some((controller_id, device_addr)) = usb::find_mass_storage() {
+        log::info!(
+            "Found USB mass storage on controller {}, device {}",
+            controller_id,
+            device_addr
+        );
+
+        // Use with_controller to create the mass storage device
+        let device_created = usb::with_controller(controller_id, |controller| {
+            match UsbMassStorage::new_generic(controller, device_addr) {
+                Ok(usb_device) => {
+                    // Store device globally WITH controller ID so global_read_sector knows which controller to use
+                    mass_storage::store_global_device_with_controller(
+                        usb_device,
+                        Some(controller_id),
+                    )
+                }
+                Err(e) => {
+                    log::debug!("Failed to create USB mass storage: {:?}", e);
+                    false
+                }
+            }
+        });
+
+        if device_created != Some(true) {
+            return;
+        }
+
+        // Now read partitions using the stored device
+        usb::with_controller(controller_id, |controller| {
+            if let Some(usb_device) = mass_storage::get_global_device() {
+                let mut disk = gpt::GenericUsbDisk::new(usb_device, controller);
+
+                // Read GPT and find partitions
+                if let Ok(header) = gpt::read_gpt_header(&mut disk) {
+                    if let Ok(partitions) = gpt::read_partitions(&mut disk, &header) {
+                        for (i, partition) in partitions.iter().enumerate() {
+                            let partition_num = (i + 1) as u32;
+
+                            // Check if this is an ESP or potential boot partition
+                            if partition.is_esp || is_potential_esp(partition) {
+                                // We need to create a new disk reference for checking bootloader
+                                // This is a bit awkward due to borrowing rules
+                                if let Some(usb_device2) = mass_storage::get_global_device() {
+                                    let mut disk2 =
+                                        gpt::GenericUsbDisk::new(usb_device2, controller);
+                                    if check_bootloader_exists(&mut disk2, partition.first_lba) {
+                                        let mut name: String<64> = String::new();
+                                        let controller_type = controller.controller_type();
+                                        let _ =
+                                            write!(name, "Boot Entry ({} USB)", controller_type);
+
+                                        // Get PCI address - we need to handle this differently
+                                        // For now use placeholder values
+                                        let entry = BootEntry::new(
+                                            &name,
+                                            "EFI\\BOOT\\BOOTX64.EFI",
+                                            DeviceType::UsbGeneric {
+                                                controller_id,
+                                                device_addr,
+                                            },
+                                            partition_num,
+                                            partition.clone(),
+                                            0, // PCI device - TODO: get from controller
+                                            0, // PCI function - TODO: get from controller
+                                        );
+
+                                        menu.add_entry(entry);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 

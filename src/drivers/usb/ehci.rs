@@ -3,8 +3,19 @@
 //! This module provides support for USB 2.0 high-speed devices via the
 //! Enhanced Host Controller Interface.
 //!
+//! # Architecture
+//!
+//! EHCI uses two main data structures for transfers:
+//! - Queue Head (QH): Describes an endpoint and links to transfer descriptors
+//! - Queue Element Transfer Descriptor (qTD): Describes a single transfer
+//!
+//! The controller maintains two schedules:
+//! - Asynchronous schedule: For control and bulk transfers (linked list of QHs)
+//! - Periodic schedule: For interrupt and isochronous transfers (frame list)
+//!
 //! # References
 //! - EHCI Specification 1.0
+//! - U-Boot drivers/usb/host/ehci-hcd.c
 //! - libpayload ehci.c
 
 use crate::drivers::pci::{self, PciAddress, PciDevice};
@@ -13,48 +24,122 @@ use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
-use super::core::{
-    class, desc_type, parse_configuration, req_type, request, ConfigurationInfo, DeviceDescriptor,
-    DeviceInfo, Direction, EndpointInfo, EndpointType, InterfaceInfo, UsbController, UsbError,
-    UsbSpeed,
+use super::controller::{
+    desc_type, parse_configuration, req_type, request, ConfigurationInfo, DeviceDescriptor,
+    DeviceInfo, EndpointInfo, UsbController, UsbError, UsbSpeed,
 };
+
+// ============================================================================
+// Cache Management for DMA
+// ============================================================================
+
+/// Cache line size (typically 64 bytes on modern x86)
+const CACHE_LINE_SIZE: usize = 64;
+
+/// Flush a memory range from CPU cache to main memory
+///
+/// This ensures the EHCI controller (doing DMA) sees the data written by the CPU.
+#[inline]
+fn flush_cache_range(addr: u64, size: usize) {
+    let start = addr as usize & !(CACHE_LINE_SIZE - 1);
+    let end = (addr as usize + size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
+
+    for line in (start..end).step_by(CACHE_LINE_SIZE) {
+        unsafe {
+            core::arch::asm!(
+                "clflush [{}]",
+                in(reg) line,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    // Memory fence to ensure flushes complete before continuing
+    fence(Ordering::SeqCst);
+}
+
+/// Invalidate a memory range in CPU cache
+///
+/// This ensures the CPU sees data written by the EHCI controller (DMA).
+/// On x86, clflush both writes back and invalidates, so we use the same instruction.
+#[inline]
+fn invalidate_cache_range(addr: u64, size: usize) {
+    flush_cache_range(addr, size);
+}
 
 // ============================================================================
 // EHCI Register Definitions
 // ============================================================================
 
-/// EHCI Capability Registers
-mod cap_regs {
-    /// Capability Register Length + HCI Version
-    pub const CAPLENGTH: u32 = 0x00;
+/// Host Controller Capability Registers (read-only)
+#[repr(C)]
+pub struct EhciCapRegs {
+    /// Capability Register Length and Interface Version
+    /// [7:0] = CAPLENGTH: Offset to Operational Registers
+    /// [31:16] = HCIVERSION: Interface Version Number
+    pub cap_length_hci_version: u32,
     /// Structural Parameters
-    pub const HCSPARAMS: u32 = 0x04;
+    pub hcs_params: u32,
     /// Capability Parameters
-    pub const HCCPARAMS: u32 = 0x08;
+    pub hcc_params: u32,
     /// Companion Port Route Description
-    pub const HCSP_PORTROUTE: u32 = 0x0C;
+    pub hcsp_portroute: [u8; 8],
 }
 
-/// EHCI Operational Registers
-mod op_regs {
-    /// USB Command
-    pub const USBCMD: u32 = 0x00;
-    /// USB Status
-    pub const USBSTS: u32 = 0x04;
+impl EhciCapRegs {
+    /// Get capability register length (offset to operational registers)
+    pub fn cap_length(&self) -> u8 {
+        (self.cap_length_hci_version & 0xFF) as u8
+    }
+
+    /// Get interface version
+    pub fn hci_version(&self) -> u16 {
+        ((self.cap_length_hci_version >> 16) & 0xFFFF) as u16
+    }
+
+    /// Get number of ports
+    pub fn num_ports(&self) -> u8 {
+        (self.hcs_params & 0x0F) as u8
+    }
+
+    /// Check if port power control is supported
+    pub fn has_port_power_control(&self) -> bool {
+        (self.hcs_params & (1 << 4)) != 0
+    }
+
+    /// Check if 64-bit addressing is supported
+    pub fn has_64bit(&self) -> bool {
+        (self.hcc_params & 1) != 0
+    }
+
+    /// Get EECP (EHCI Extended Capabilities Pointer)
+    pub fn eecp(&self) -> u8 {
+        ((self.hcc_params >> 8) & 0xFF) as u8
+    }
+}
+
+/// Host Controller Operational Registers
+#[repr(C)]
+pub struct EhciOpRegs {
+    /// USB Command Register
+    pub usbcmd: u32,
+    /// USB Status Register
+    pub usbsts: u32,
     /// USB Interrupt Enable
-    pub const USBINTR: u32 = 0x08;
-    /// Frame Index
-    pub const FRINDEX: u32 = 0x0C;
+    pub usbintr: u32,
+    /// USB Frame Index
+    pub frindex: u32,
     /// 4G Segment Selector
-    pub const CTRLDSSEGMENT: u32 = 0x10;
+    pub ctrldssegment: u32,
     /// Periodic Frame List Base Address
-    pub const PERIODICLISTBASE: u32 = 0x14;
-    /// Async List Address
-    pub const ASYNCLISTADDR: u32 = 0x18;
-    /// Configured Flag
-    pub const CONFIGFLAG: u32 = 0x40;
-    /// Port Status/Control (base, each port +4)
-    pub const PORTSC_BASE: u32 = 0x44;
+    pub periodiclistbase: u32,
+    /// Current Asynchronous List Address
+    pub asynclistaddr: u32,
+    /// Reserved
+    _reserved: [u32; 9],
+    /// Configure Flag Register
+    pub configflag: u32,
+    /// Port Status/Control Registers (up to 15 ports)
+    pub portsc: [u32; 15],
 }
 
 /// USB Command Register bits
@@ -63,18 +148,24 @@ mod usbcmd {
     pub const RS: u32 = 1 << 0;
     /// Host Controller Reset
     pub const HCRESET: u32 = 1 << 1;
-    /// Frame List Size (bits 2-3)
+    /// Frame List Size (bits 3:2)
     pub const FLS_MASK: u32 = 3 << 2;
-    pub const FLS_1024: u32 = 0 << 2;
     /// Periodic Schedule Enable
     pub const PSE: u32 = 1 << 4;
     /// Async Schedule Enable
     pub const ASE: u32 = 1 << 5;
     /// Interrupt on Async Advance Doorbell
     pub const IAAD: u32 = 1 << 6;
-    /// Interrupt Threshold Control (bits 16-23)
+    /// Light Host Controller Reset
+    pub const LHCRESET: u32 = 1 << 7;
+    /// Async Schedule Park Mode Count (bits 9:8)
+    pub const ASPMC_MASK: u32 = 3 << 8;
+    /// Async Schedule Park Mode Enable
+    pub const ASPME: u32 = 1 << 11;
+    /// Interrupt Threshold Control (bits 23:16)
     pub const ITC_MASK: u32 = 0xFF << 16;
-    pub const ITC_8: u32 = 8 << 16;
+    /// Interrupt every 8 micro-frames
+    pub const ITC_8: u32 = 0x08 << 16;
 }
 
 /// USB Status Register bits
@@ -91,7 +182,7 @@ mod usbsts {
     pub const HSE: u32 = 1 << 4;
     /// Interrupt on Async Advance
     pub const IAA: u32 = 1 << 5;
-    /// Host Controller Halted
+    /// HC Halted
     pub const HCHALTED: u32 = 1 << 12;
     /// Reclamation
     pub const RECLAMATION: u32 = 1 << 13;
@@ -101,7 +192,7 @@ mod usbsts {
     pub const ASS: u32 = 1 << 15;
 }
 
-/// Port Status/Control bits
+/// Port Status/Control Register bits
 mod portsc {
     /// Current Connect Status
     pub const CCS: u32 = 1 << 0;
@@ -121,218 +212,313 @@ mod portsc {
     pub const SUSPEND: u32 = 1 << 7;
     /// Port Reset
     pub const PR: u32 = 1 << 8;
-    /// Line Status (bits 10-11)
+    /// Line Status (bits 11:10)
     pub const LS_MASK: u32 = 3 << 10;
+    /// Line Status: SE0
     pub const LS_SE0: u32 = 0 << 10;
-    pub const LS_JSTATE: u32 = 1 << 10;
-    pub const LS_KSTATE: u32 = 2 << 10;
+    /// Line Status: J-state (FS)
+    pub const LS_J: u32 = 2 << 10;
+    /// Line Status: K-state (LS)
+    pub const LS_K: u32 = 1 << 10;
     /// Port Power
     pub const PP: u32 = 1 << 12;
     /// Port Owner (1 = companion controller)
     pub const PO: u32 = 1 << 13;
-    /// Port Indicator Control (bits 14-15)
+    /// Port Indicator Control (bits 15:14)
     pub const PIC_MASK: u32 = 3 << 14;
-    /// Port Test Control (bits 16-19)
+    /// Port Test Control (bits 19:16)
     pub const PTC_MASK: u32 = 0xF << 16;
     /// Wake on Connect Enable
-    pub const WKOC_E: u32 = 1 << 20;
+    pub const WKOC_E: u32 = 1 << 22;
     /// Wake on Disconnect Enable
-    pub const WKDC_E: u32 = 1 << 21;
+    pub const WKDSCNNT_E: u32 = 1 << 21;
     /// Wake on Over-current Enable
-    pub const WKOC: u32 = 1 << 22;
-    /// Write-1-to-clear bits
-    pub const W1C_MASK: u32 = CSC | PEC | OCC;
+    pub const WKCNNT_E: u32 = 1 << 20;
+
+    /// Write-clear status bits
+    pub const WC_BITS: u32 = CSC | PEC | OCC;
+}
+
+/// Configure Flag Register bits
+mod configflag {
+    /// Configure Flag
+    pub const CF: u32 = 1 << 0;
 }
 
 // ============================================================================
-// EHCI Data Structures
+// EHCI Extended Capabilities
 // ============================================================================
 
-/// Queue Head (48 bytes, 32-byte aligned)
+/// USBLEGSUP (Legacy Support) Extended Capability
+mod usblegsup {
+    /// Capability ID (should be 0x01)
+    pub const CAP_ID: u8 = 0x01;
+    /// HC BIOS Owned Semaphore
+    pub const HC_BIOS_OWNED: u32 = 1 << 16;
+    /// HC OS Owned Semaphore
+    pub const HC_OS_OWNED: u32 = 1 << 24;
+}
+
+// ============================================================================
+// EHCI Data Structures (Memory-mapped)
+// ============================================================================
+
+/// Transfer Overlay - same layout as qTD but without alignment requirements
+/// Used inside QH where it must start at offset 16 (not 32)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct QtdOverlay {
+    /// Next qTD Pointer
+    pub next_qtd: u32,
+    /// Alternate Next qTD Pointer
+    pub alt_next_qtd: u32,
+    /// qTD Token
+    pub token: u32,
+    /// Buffer Pointer Page 0 + Current Offset
+    pub buffer: [u32; 5],
+    /// Extended Buffer Pointer (for 64-bit)
+    pub buffer_hi: [u32; 5],
+}
+
+impl Default for QtdOverlay {
+    fn default() -> Self {
+        Self {
+            next_qtd: Qtd::TERMINATE,
+            alt_next_qtd: Qtd::TERMINATE,
+            token: 0,
+            buffer: [0; 5],
+            buffer_hi: [0; 5],
+        }
+    }
+}
+
+/// Queue Element Transfer Descriptor (qTD) - 32 bytes minimum, 32-byte aligned
+/// Standalone qTDs must be 32-byte aligned per EHCI spec section 3.5
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
-pub struct QueueHead {
-    /// Horizontal Link Pointer
-    pub horiz_link_ptr: u32,
+pub struct Qtd {
+    /// Next qTD Pointer
+    pub next_qtd: u32,
+    /// Alternate Next qTD Pointer
+    pub alt_next_qtd: u32,
+    /// qTD Token
+    pub token: u32,
+    /// Buffer Pointer Page 0 + Current Offset
+    pub buffer: [u32; 5],
+    /// Extended Buffer Pointer (for 64-bit)
+    pub buffer_hi: [u32; 5],
+}
+
+impl Default for Qtd {
+    fn default() -> Self {
+        Self {
+            next_qtd: Self::TERMINATE,
+            alt_next_qtd: Self::TERMINATE,
+            token: 0,
+            buffer: [0; 5],
+            buffer_hi: [0; 5],
+        }
+    }
+}
+
+impl Qtd {
+    /// Terminate bit
+    pub const TERMINATE: u32 = 1;
+
+    /// Token bits
+    pub const TOKEN_STATUS_MASK: u32 = 0xFF;
+    pub const TOKEN_STATUS_ACTIVE: u32 = 1 << 7;
+    pub const TOKEN_STATUS_HALTED: u32 = 1 << 6;
+    pub const TOKEN_STATUS_BUFFER_ERR: u32 = 1 << 5;
+    pub const TOKEN_STATUS_BABBLE: u32 = 1 << 4;
+    pub const TOKEN_STATUS_XACT_ERR: u32 = 1 << 3;
+    pub const TOKEN_STATUS_MISSED_UFRAME: u32 = 1 << 2;
+    pub const TOKEN_STATUS_SPLIT: u32 = 1 << 1;
+    pub const TOKEN_STATUS_PERR: u32 = 1 << 0;
+
+    pub const TOKEN_PID_OUT: u32 = 0 << 8;
+    pub const TOKEN_PID_IN: u32 = 1 << 8;
+    pub const TOKEN_PID_SETUP: u32 = 2 << 8;
+
+    pub const TOKEN_CERR_SHIFT: u32 = 10;
+    pub const TOKEN_CPAGE_SHIFT: u32 = 12;
+    pub const TOKEN_IOC: u32 = 1 << 15;
+    pub const TOKEN_BYTES_SHIFT: u32 = 16;
+    pub const TOKEN_BYTES_MASK: u32 = 0x7FFF << 16;
+    pub const TOKEN_TOGGLE: u32 = 1 << 31;
+
+    /// Create a new qTD
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set up buffers for a transfer
+    pub fn set_buffers(&mut self, addr: u64, len: usize) {
+        // First buffer pointer includes the offset within the page
+        self.buffer[0] = addr as u32;
+        self.buffer_hi[0] = (addr >> 32) as u32;
+
+        // Subsequent buffer pointers are page-aligned
+        let mut remaining = len;
+        let mut current_addr = addr;
+
+        for i in 1..5 {
+            if remaining == 0 {
+                break;
+            }
+            // Move to next 4KB page
+            current_addr = (current_addr + 0x1000) & !0xFFF;
+            self.buffer[i] = current_addr as u32;
+            self.buffer_hi[i] = (current_addr >> 32) as u32;
+
+            let page_offset = (addr & 0xFFF) as usize;
+            let first_page_bytes = 0x1000 - page_offset;
+            if i == 1 {
+                if remaining > first_page_bytes {
+                    remaining -= first_page_bytes;
+                } else {
+                    remaining = 0;
+                }
+            } else if remaining > 0x1000 {
+                remaining -= 0x1000;
+            } else {
+                remaining = 0;
+            }
+        }
+    }
+
+    /// Check if qTD is active
+    pub fn is_active(&self) -> bool {
+        (self.token & Self::TOKEN_STATUS_ACTIVE) != 0
+    }
+
+    /// Check if qTD has error
+    pub fn has_error(&self) -> bool {
+        (self.token
+            & (Self::TOKEN_STATUS_HALTED
+                | Self::TOKEN_STATUS_BUFFER_ERR
+                | Self::TOKEN_STATUS_BABBLE
+                | Self::TOKEN_STATUS_XACT_ERR))
+            != 0
+    }
+
+    /// Check if qTD is halted (stalled)
+    pub fn is_halted(&self) -> bool {
+        (self.token & Self::TOKEN_STATUS_HALTED) != 0
+    }
+
+    /// Get actual bytes transferred
+    pub fn bytes_transferred(&self, total: usize) -> usize {
+        let remaining = ((self.token & Self::TOKEN_BYTES_MASK) >> Self::TOKEN_BYTES_SHIFT) as usize;
+        total.saturating_sub(remaining)
+    }
+}
+
+/// Queue Head (QH) - 48 bytes minimum, 32-byte aligned
+/// Per EHCI spec section 3.6, the layout is:
+/// - DWord 0 (offset 0): Queue Head Horizontal Link Pointer
+/// - DWord 1 (offset 4): Endpoint Characteristics
+/// - DWord 2 (offset 8): Endpoint Capabilities
+/// - DWord 3 (offset 12): Current qTD Pointer
+/// - DWords 4-11 (offset 16): Transfer Overlay (embedded qTD)
+#[repr(C, align(32))]
+#[derive(Clone, Copy)]
+pub struct Qh {
+    /// Queue Head Horizontal Link Pointer
+    pub qh_link: u32,
     /// Endpoint Characteristics
     pub ep_chars: u32,
     /// Endpoint Capabilities
     pub ep_caps: u32,
     /// Current qTD Pointer
-    pub cur_qtd: u32,
-    /// Transfer Overlay (qTD)
-    pub overlay: QueueTransferDescriptor,
+    pub current_qtd: u32,
+    /// Transfer overlay (qTD that HC uses for state) - must be at offset 16!
+    pub overlay: QtdOverlay,
 }
 
-impl Default for QueueHead {
+impl Default for Qh {
     fn default() -> Self {
-        unsafe { core::mem::zeroed() }
+        Self {
+            qh_link: Self::TERMINATE,
+            ep_chars: 0,
+            ep_caps: 0,
+            current_qtd: 0,
+            overlay: QtdOverlay::default(),
+        }
     }
 }
 
-impl QueueHead {
-    /// Create a new Queue Head
-    pub fn new(
+impl Qh {
+    /// Link pointer type bits
+    pub const TERMINATE: u32 = 1;
+    pub const TYPE_ITD: u32 = 0 << 1;
+    pub const TYPE_QH: u32 = 1 << 1;
+    pub const TYPE_SITD: u32 = 2 << 1;
+    pub const TYPE_FSTN: u32 = 3 << 1;
+    pub const TYPE_MASK: u32 = 3 << 1;
+
+    /// Endpoint Characteristics bits
+    pub const EP_DEVADDR_MASK: u32 = 0x7F;
+    pub const EP_INACTIVE: u32 = 1 << 7;
+    pub const EP_ENDPT_SHIFT: u32 = 8;
+    pub const EP_ENDPT_MASK: u32 = 0xF << 8;
+    pub const EP_EPS_SHIFT: u32 = 12;
+    pub const EP_EPS_FULL: u32 = 0 << 12;
+    pub const EP_EPS_LOW: u32 = 1 << 12;
+    pub const EP_EPS_HIGH: u32 = 2 << 12;
+    pub const EP_DTC: u32 = 1 << 14;
+    pub const EP_HEAD: u32 = 1 << 15;
+    pub const EP_MAXPKT_SHIFT: u32 = 16;
+    pub const EP_MAXPKT_MASK: u32 = 0x7FF << 16;
+    pub const EP_CTRL: u32 = 1 << 27;
+    pub const EP_RL_SHIFT: u32 = 28;
+    pub const EP_RL_MASK: u32 = 0xF << 28;
+
+    /// Endpoint Capabilities bits
+    pub const CAP_SMASK_SHIFT: u32 = 0;
+    pub const CAP_CMASK_SHIFT: u32 = 8;
+    pub const CAP_HUBADDR_SHIFT: u32 = 16;
+    pub const CAP_PORTNUM_SHIFT: u32 = 23;
+    pub const CAP_MULT_SHIFT: u32 = 30;
+
+    /// Create a new QH
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure QH for a device endpoint
+    pub fn configure(
+        &mut self,
         device_addr: u8,
         endpoint: u8,
         max_packet: u16,
         speed: UsbSpeed,
         is_control: bool,
-    ) -> Self {
-        let mut qh = Self::default();
-
-        // Endpoint Characteristics
-        let mut ep_chars = (device_addr as u32) & 0x7F; // Device address
-        ep_chars |= ((endpoint as u32) & 0xF) << 8; // Endpoint number
-        ep_chars |= match speed {
-            UsbSpeed::Low => 1 << 12,
-            UsbSpeed::Full => 0 << 12,
-            UsbSpeed::High | _ => 2 << 12,
+    ) {
+        let eps = match speed {
+            UsbSpeed::Low => Self::EP_EPS_LOW,
+            UsbSpeed::Full => Self::EP_EPS_FULL,
+            _ => Self::EP_EPS_HIGH,
         };
+
+        self.ep_chars = (device_addr as u32 & Self::EP_DEVADDR_MASK)
+            | ((endpoint as u32) << Self::EP_ENDPT_SHIFT)
+            | eps
+            | Self::EP_DTC // Data toggle from qTD
+            | ((max_packet as u32) << Self::EP_MAXPKT_SHIFT)
+            | (8 << Self::EP_RL_SHIFT); // NAK reload = 8
+
         if is_control && speed != UsbSpeed::High {
-            ep_chars |= 1 << 27; // Control Endpoint Flag for full/low speed
-        }
-        ep_chars |= ((max_packet as u32) & 0x7FF) << 16; // Max packet size
-        if is_control {
-            ep_chars |= 1 << 14; // DTC = 1 for control endpoints
-        }
-        qh.ep_chars = ep_chars;
-
-        // Endpoint Capabilities
-        let mut ep_caps = 1 << 30; // High-Bandwidth Pipe Multiplier = 1
-        if speed != UsbSpeed::High {
-            // For full/low speed devices behind a high-speed hub
-            ep_caps |= 0x1C; // S-mask (microframe schedule mask)
-        }
-        qh.ep_caps = ep_caps;
-
-        // Terminate horizontal link
-        qh.horiz_link_ptr = 1; // T-bit set
-
-        // Initialize overlay
-        qh.overlay.next_qtd = 1; // Terminated
-        qh.overlay.alt_qtd = 1; // Terminated
-        qh.overlay.token = 0;
-
-        qh
-    }
-}
-
-/// Queue Transfer Descriptor (32 bytes, 32-byte aligned)
-#[repr(C, align(32))]
-#[derive(Clone, Copy, Default)]
-pub struct QueueTransferDescriptor {
-    /// Next qTD Pointer
-    pub next_qtd: u32,
-    /// Alternate Next qTD Pointer
-    pub alt_qtd: u32,
-    /// Token
-    pub token: u32,
-    /// Buffer Pointers (5 pages max = 20KB)
-    pub buffer_ptrs: [u32; 5],
-    /// Extended Buffer Pointers (for 64-bit)
-    pub ext_buffer_ptrs: [u32; 5],
-}
-
-impl QueueTransferDescriptor {
-    /// PID codes
-    pub const PID_OUT: u32 = 0 << 8;
-    pub const PID_IN: u32 = 1 << 8;
-    pub const PID_SETUP: u32 = 2 << 8;
-
-    /// Token bits
-    pub const TOKEN_ACTIVE: u32 = 1 << 7;
-    pub const TOKEN_HALTED: u32 = 1 << 6;
-    pub const TOKEN_DATA_BUFFER_ERROR: u32 = 1 << 5;
-    pub const TOKEN_BABBLE: u32 = 1 << 4;
-    pub const TOKEN_XACT_ERROR: u32 = 1 << 3;
-    pub const TOKEN_MISSED_UFRAME: u32 = 1 << 2;
-    pub const TOKEN_SPLIT_STATE: u32 = 1 << 1;
-    pub const TOKEN_PING_STATE: u32 = 1 << 0;
-    pub const TOKEN_ERROR_MASK: u32 = Self::TOKEN_HALTED
-        | Self::TOKEN_DATA_BUFFER_ERROR
-        | Self::TOKEN_BABBLE
-        | Self::TOKEN_XACT_ERROR;
-
-    /// Create a SETUP stage qTD
-    pub fn setup(setup_packet: &[u8; 8], data_toggle: bool) -> Self {
-        let mut qtd = Self::default();
-        qtd.next_qtd = 1; // Terminated (will be linked later)
-        qtd.alt_qtd = 1;
-        qtd.token = Self::PID_SETUP
-            | Self::TOKEN_ACTIVE
-            | (3 << 10) // CERR = 3
-            | (8 << 16); // Total bytes = 8
-        if data_toggle {
-            qtd.token |= 1 << 31; // Data toggle
-        }
-        // Copy setup packet to first buffer
-        qtd.buffer_ptrs[0] = setup_packet.as_ptr() as u32;
-        qtd
-    }
-
-    /// Create a DATA stage qTD
-    pub fn data(buffer: *mut u8, length: usize, is_in: bool, data_toggle: bool) -> Self {
-        let mut qtd = Self::default();
-        qtd.next_qtd = 1;
-        qtd.alt_qtd = 1;
-        qtd.token = if is_in { Self::PID_IN } else { Self::PID_OUT }
-            | Self::TOKEN_ACTIVE
-            | (3 << 10) // CERR = 3
-            | ((length as u32 & 0x7FFF) << 16); // Total bytes
-        if data_toggle {
-            qtd.token |= 1 << 31;
+            self.ep_chars |= Self::EP_CTRL;
         }
 
-        // Set up buffer pointers (can span up to 5 pages)
-        let mut addr = buffer as usize;
-        let mut remaining = length;
-        for i in 0..5 {
-            if remaining == 0 {
-                break;
-            }
-            qtd.buffer_ptrs[i] = addr as u32;
-            let page_offset = addr & 0xFFF;
-            let this_page = (0x1000 - page_offset).min(remaining);
-            addr += this_page;
-            remaining -= this_page;
-        }
-
-        qtd
-    }
-
-    /// Create a STATUS stage qTD
-    pub fn status(is_in: bool) -> Self {
-        let mut qtd = Self::default();
-        qtd.next_qtd = 1;
-        qtd.alt_qtd = 1;
-        qtd.token = if is_in { Self::PID_IN } else { Self::PID_OUT }
-            | Self::TOKEN_ACTIVE
-            | (3 << 10) // CERR = 3
-            | (1 << 15) // IOC (Interrupt on Complete)
-            | (1 << 31); // Data toggle = 1 for status
-        qtd
-    }
-
-    /// Check if transfer is complete
-    pub fn is_complete(&self) -> bool {
-        (self.token & Self::TOKEN_ACTIVE) == 0
-    }
-
-    /// Check if transfer had errors
-    pub fn has_error(&self) -> bool {
-        (self.token & Self::TOKEN_ERROR_MASK) != 0
-    }
-
-    /// Get the number of bytes transferred
-    pub fn bytes_transferred(&self, original_length: usize) -> usize {
-        let remaining = ((self.token >> 16) & 0x7FFF) as usize;
-        original_length.saturating_sub(remaining)
+        // High-bandwidth multiplier = 1
+        self.ep_caps = 1 << Self::CAP_MULT_SHIFT;
     }
 }
 
 // ============================================================================
-// USB Device State
+// EHCI Device State
 // ============================================================================
 
 /// EHCI USB device state
@@ -378,7 +564,7 @@ impl EhciDevice {
             bulk_in: None,
             bulk_out: None,
             interrupt_in: None,
-            ep0_max_packet: speed.default_max_packet_size(),
+            ep0_max_packet: if speed == UsbSpeed::High { 64 } else { 8 },
             bulk_in_toggle: false,
             bulk_out_toggle: false,
         }
@@ -390,10 +576,10 @@ impl EhciDevice {
 // ============================================================================
 
 /// Maximum number of devices
-const MAX_DEVICES: usize = 8;
+const MAX_DEVICES: usize = 16;
 
 /// Maximum number of ports
-const MAX_PORTS: usize = 8;
+const MAX_PORTS: usize = 15;
 
 /// EHCI Host Controller
 pub struct EhciController {
@@ -401,325 +587,373 @@ pub struct EhciController {
     pci_address: PciAddress,
     /// MMIO base address
     mmio_base: u64,
+    /// Capability registers base
+    cap_regs: u64,
     /// Operational registers base
-    op_base: u64,
+    op_regs: u64,
     /// Number of ports
     num_ports: u8,
+    /// 64-bit addressing supported
+    has_64bit: bool,
     /// Devices
     devices: [Option<EhciDevice>; MAX_DEVICES],
     /// Next device address
     next_address: u8,
-    /// Async list head QH
+    /// Async schedule list head QH
     async_qh: u64,
     /// Periodic frame list
     periodic_list: u64,
-    /// DMA buffer for control transfers
+    /// DMA buffer for transfers
     dma_buffer: u64,
+    /// QH pool
+    qh_pool: u64,
+    /// qTD pool
+    qtd_pool: u64,
 }
 
 impl EhciController {
     /// DMA buffer size (64KB)
     const DMA_BUFFER_SIZE: usize = 64 * 1024;
-
-    /// EHCI Extended Capability: USB Legacy Support
-    const EHCI_CAP_LEGACY: u8 = 0x01;
-
-    /// USBLEGSUP register offsets
-    const USBLEGSUP_OFFSET: u8 = 0x00;
-    const USBLEGCTLSTS_OFFSET: u8 = 0x04;
-
-    /// USBLEGSUP bits
-    const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
-    const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
-
-    /// Take ownership of the controller from BIOS/SMM
-    ///
-    /// EHCI has an optional extended capability for BIOS ownership handoff.
-    /// We need to claim ownership before initializing the controller.
-    fn take_bios_ownership(pci_addr: PciAddress, hccparams: u32) {
-        // EECP (Extended Capabilities Pointer) is in bits 15:8
-        let mut eecp = ((hccparams >> 8) & 0xFF) as u8;
-
-        if eecp == 0 {
-            // No extended capabilities
-            return;
-        }
-
-        // Walk the capability chain looking for USBLEGSUP (cap ID 0x01)
-        while eecp >= 0x40 {
-            let cap = pci::read_config_u32(pci_addr, eecp);
-            let cap_id = (cap & 0xFF) as u8;
-            let next_ptr = ((cap >> 8) & 0xFF) as u8;
-
-            if cap_id == Self::EHCI_CAP_LEGACY {
-                // Found USBLEGSUP - check if BIOS owns it
-                if (cap & Self::USBLEGSUP_BIOS_OWNED) != 0 {
-                    log::debug!("EHCI: Taking ownership from BIOS (USBLEGSUP={:#010x})", cap);
-
-                    // Set OS owned semaphore
-                    pci::write_config_u32(pci_addr, eecp, cap | Self::USBLEGSUP_OS_OWNED);
-
-                    // Wait for BIOS to release (up to 1 second)
-                    let timeout = Timeout::from_ms(1000);
-                    while !timeout.is_expired() {
-                        let new_cap = pci::read_config_u32(pci_addr, eecp);
-                        if (new_cap & Self::USBLEGSUP_BIOS_OWNED) == 0 {
-                            log::debug!("EHCI: BIOS released ownership");
-                            break;
-                        }
-                        crate::time::delay_ms(10);
-                    }
-
-                    // Clear any SMI enables in USBLEGCTLSTS
-                    let ctlsts_offset = eecp + Self::USBLEGCTLSTS_OFFSET;
-                    let ctlsts = pci::read_config_u32(pci_addr, ctlsts_offset);
-                    // Clear SMI enable bits (bits 0-6, 13-15, 29, 31) but preserve status bits
-                    let new_ctlsts = ctlsts & 0x1FFF1FFF;
-                    if ctlsts != new_ctlsts {
-                        pci::write_config_u32(pci_addr, ctlsts_offset, new_ctlsts);
-                    }
-                }
-                break;
-            }
-
-            eecp = next_ptr;
-            if eecp == 0 {
-                break;
-            }
-        }
-    }
+    /// Frame list size (1024 entries * 4 bytes)
+    const FRAME_LIST_SIZE: usize = 1024;
 
     /// Create a new EHCI controller from a PCI device
     pub fn new(pci_dev: &PciDevice) -> Result<Self, UsbError> {
+        // EHCI uses MMIO from BAR0
         let mmio_base = pci_dev.mmio_base().ok_or(UsbError::NotReady)?;
 
         // Enable the device (bus master + memory space)
         pci::enable_device(pci_dev);
 
+        log::info!("EHCI controller at MMIO base {:#x}", mmio_base);
+
         // Read capability registers
-        let cap_dword0 = unsafe { ptr::read_volatile(mmio_base as *const u32) };
-        let caplength = (cap_dword0 & 0xFF) as u8;
-        let hciversion = (cap_dword0 >> 16) & 0xFFFF;
+        let cap_regs = mmio_base;
+        let cap = unsafe { &*(cap_regs as *const EhciCapRegs) };
+        let cap_length = cap.cap_length();
+        let hci_version = cap.hci_version();
+        let num_ports = cap.num_ports().min(MAX_PORTS as u8);
+        let has_64bit = cap.has_64bit();
+        let eecp = cap.eecp();
 
-        let hcsparams =
-            unsafe { ptr::read_volatile((mmio_base + cap_regs::HCSPARAMS as u64) as *const u32) };
-        let hccparams =
-            unsafe { ptr::read_volatile((mmio_base + cap_regs::HCCPARAMS as u64) as *const u32) };
-
-        let num_ports = (hcsparams & 0xF) as u8;
-        let op_base = mmio_base + caplength as u64;
-
-        // Take ownership from BIOS/SMM before doing anything else
-        Self::take_bios_ownership(pci_dev.address, hccparams);
-
-        log::info!(
-            "EHCI version: {}.{:02}, ports: {}",
-            (hciversion >> 8) & 0xFF,
-            hciversion & 0xFF,
-            num_ports
+        log::debug!(
+            "EHCI: version {:#x}, {} ports, 64-bit: {}, EECP: {:#x}",
+            hci_version,
+            num_ports,
+            has_64bit,
+            eecp
         );
 
-        // Allocate async list head QH (32-byte aligned)
-        let async_qh = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
+        let op_regs = mmio_base + cap_length as u64;
+
+        // Allocate memory structures below 4GB for DMA (EHCI uses 32-bit addresses)
+        // Async QH (32-byte aligned)
+        let async_qh = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
         unsafe { ptr::write_bytes(async_qh as *mut u8, 0, 4096) };
 
-        // Allocate periodic frame list (4KB, 4KB-aligned)
-        let periodic_list = efi::allocate_pages(1).ok_or(UsbError::AllocationFailed)?;
-        // Initialize to all terminated entries
-        unsafe {
-            let list = periodic_list as *mut u32;
-            for i in 0..1024 {
-                ptr::write_volatile(list.add(i), 1); // T-bit set
-            }
-        }
+        // Periodic frame list (4KB aligned, 4KB)
+        let periodic_list = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
 
-        // Allocate DMA buffer
+        // DMA buffer
         let dma_pages = (Self::DMA_BUFFER_SIZE + 4095) / 4096;
-        let dma_buffer = efi::allocate_pages(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+        let dma_buffer =
+            efi::allocate_pages_below_4g(dma_pages as u64).ok_or(UsbError::AllocationFailed)?;
+
+        // QH pool (enough for multiple QHs)
+        let qh_pool = efi::allocate_pages_below_4g(1).ok_or(UsbError::AllocationFailed)?;
+        unsafe { ptr::write_bytes(qh_pool as *mut u8, 0, 4096) };
+
+        // qTD pool (enough for multiple qTDs)
+        let qtd_pool = efi::allocate_pages_below_4g(2).ok_or(UsbError::AllocationFailed)?;
+        unsafe { ptr::write_bytes(qtd_pool as *mut u8, 0, 8192) };
 
         let mut controller = Self {
             pci_address: pci_dev.address,
             mmio_base,
-            op_base,
-            num_ports: num_ports.min(MAX_PORTS as u8),
+            cap_regs,
+            op_regs,
+            num_ports,
+            has_64bit,
             devices: core::array::from_fn(|_| None),
             next_address: 1,
             async_qh,
             periodic_list,
             dma_buffer,
+            qh_pool,
+            qtd_pool,
         };
 
+        // Take ownership from BIOS
+        controller.take_ownership(pci_dev.address, eecp)?;
+
+        // Initialize the controller
         controller.init()?;
+
+        // Enumerate ports
         controller.enumerate_ports()?;
 
         Ok(controller)
     }
 
-    fn read_op_reg(&self, offset: u32) -> u32 {
-        unsafe { ptr::read_volatile((self.op_base + offset as u64) as *const u32) }
+    /// Get operational register
+    fn read_op(&self, offset: usize) -> u32 {
+        unsafe { ptr::read_volatile((self.op_regs + offset as u64) as *const u32) }
     }
 
-    fn write_op_reg(&mut self, offset: u32, value: u32) {
-        unsafe { ptr::write_volatile((self.op_base + offset as u64) as *mut u32, value) }
+    /// Write operational register
+    fn write_op(&mut self, offset: usize, value: u32) {
+        unsafe { ptr::write_volatile((self.op_regs + offset as u64) as *mut u32, value) }
     }
 
-    fn read_port_reg(&self, port: u8) -> u32 {
-        let addr = self.op_base + op_regs::PORTSC_BASE as u64 + (port as u64 * 4);
-        unsafe { ptr::read_volatile(addr as *const u32) }
+    /// Read port status register
+    fn read_portsc(&self, port: u8) -> u32 {
+        let offset = 0x44 + (port as usize) * 4; // PORTSC starts at 0x44
+        self.read_op(offset)
     }
 
-    fn write_port_reg(&mut self, port: u8, value: u32) {
-        let addr = self.op_base + op_regs::PORTSC_BASE as u64 + (port as u64 * 4);
-        unsafe { ptr::write_volatile(addr as *mut u32, value) }
+    /// Write port status register
+    fn write_portsc(&mut self, port: u8, value: u32) {
+        let offset = 0x44 + (port as usize) * 4;
+        self.write_op(offset, value);
     }
 
-    /// Enable or disable async schedule and wait for status to match
-    fn set_async_schedule(&mut self, enable: bool) -> Result<(), UsbError> {
-        // Memory barrier before modifying schedule
-        fence(Ordering::SeqCst);
-
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        if enable {
-            self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::ASE);
-        } else {
-            self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::ASE);
+    /// Take ownership from BIOS via USBLEGSUP extended capability
+    fn take_ownership(&mut self, pci_addr: PciAddress, eecp: u8) -> Result<(), UsbError> {
+        if eecp == 0 {
+            return Ok(());
         }
 
-        // Wait for status to match (up to 100ms)
-        let expected = if enable { usbsts::ASS } else { 0 };
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if (self.read_op_reg(op_regs::USBSTS) & usbsts::ASS) == expected {
-                return Ok(());
+        let mut cap_offset = eecp;
+        while cap_offset != 0 {
+            let cap = pci::read_config_u32(pci_addr, cap_offset);
+            let cap_id = (cap & 0xFF) as u8;
+
+            if cap_id == usblegsup::CAP_ID {
+                log::trace!("EHCI: Found USBLEGSUP at offset {:#x}", cap_offset);
+
+                // Check if BIOS owns the controller
+                if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
+                    log::trace!("EHCI: Requesting ownership from BIOS");
+
+                    // Set OS owned bit
+                    pci::write_config_u32(pci_addr, cap_offset, cap | usblegsup::HC_OS_OWNED);
+
+                    // Wait for BIOS to release (up to 1 second)
+                    let timeout = Timeout::from_ms(1000);
+                    while !timeout.is_expired() {
+                        let cap = pci::read_config_u32(pci_addr, cap_offset);
+                        if (cap & usblegsup::HC_BIOS_OWNED) == 0 {
+                            log::trace!("EHCI: BIOS released ownership");
+                            break;
+                        }
+                        crate::time::delay_ms(10);
+                    }
+
+                    let cap = pci::read_config_u32(pci_addr, cap_offset);
+                    if (cap & usblegsup::HC_BIOS_OWNED) != 0 {
+                        log::warn!("EHCI: BIOS did not release ownership, forcing");
+                        pci::write_config_u32(pci_addr, cap_offset, usblegsup::HC_OS_OWNED as u32);
+                    }
+                }
+
+                // Disable SMI generation (USBLEGCTLSTS is at offset +4)
+                pci::write_config_u32(pci_addr, cap_offset + 4, 0);
+
+                break;
             }
-            crate::time::delay_ms(1);
+
+            // Next capability
+            cap_offset = ((cap >> 8) & 0xFF) as u8;
         }
 
-        log::warn!("EHCI: async schedule status change timed out");
-        Err(UsbError::Timeout)
-    }
-
-    /// Enable or disable periodic schedule and wait for status to match
-    fn set_periodic_schedule(&mut self, enable: bool) -> Result<(), UsbError> {
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        if enable {
-            self.write_op_reg(op_regs::USBCMD, cmd | usbcmd::PSE);
-        } else {
-            self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::PSE);
-        }
-
-        // Wait for status to match (up to 100ms)
-        let expected = if enable { usbsts::PSS } else { 0 };
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if (self.read_op_reg(op_regs::USBSTS) & usbsts::PSS) == expected {
-                return Ok(());
-            }
-            crate::time::delay_ms(1);
-        }
-
-        log::warn!("EHCI: periodic schedule status change timed out");
-        Err(UsbError::Timeout)
+        Ok(())
     }
 
     /// Initialize the controller
-    /// Following libpayload's ehci_init pattern - start controller first, then configure
     fn init(&mut self) -> Result<(), UsbError> {
-        // Set 64-bit segment to 0 if controller supports 64-bit addressing
-        self.write_op_reg(op_regs::CTRLDSSEGMENT, 0);
+        // Stop the controller
+        let cmd = self.read_op(0x00); // USBCMD
+        self.write_op(0x00, cmd & !usbcmd::RS);
 
-        // Start the controller first (just RS, no schedule enables yet)
-        self.write_op_reg(op_regs::USBCMD, usbcmd::RS);
+        // Wait for halt
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if (self.read_op(0x04) & usbsts::HCHALTED) != 0 {
+                // USBSTS
+                break;
+            }
+            core::hint::spin_loop();
+        }
 
-        // Take ownership from companion controllers
-        self.write_op_reg(op_regs::CONFIGFLAG, 1);
+        if (self.read_op(0x04) & usbsts::HCHALTED) == 0 {
+            log::warn!("EHCI: Controller did not halt");
+        }
 
-        // Initialize dummy QH for periodic list (helps with broken controllers)
-        let dummy_qh = unsafe { &mut *(self.async_qh as *mut QueueHead) };
-        dummy_qh.horiz_link_ptr = 1; // Terminate
-        dummy_qh.ep_chars = 0;
-        dummy_qh.ep_caps = 0;
-        dummy_qh.cur_qtd = 0;
-        dummy_qh.overlay.next_qtd = 1; // Terminate
-        dummy_qh.overlay.alt_qtd = 1;
-        dummy_qh.overlay.token = 0;
+        // Reset the controller
+        self.write_op(0x00, usbcmd::HCRESET);
 
-        // Fill periodic list with dummy QH
-        let periodic = self.periodic_list as *mut u32;
-        for i in 0..1024 {
+        let timeout = Timeout::from_ms(250);
+        while !timeout.is_expired() {
+            if (self.read_op(0x00) & usbcmd::HCRESET) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if (self.read_op(0x00) & usbcmd::HCRESET) != 0 {
+            return Err(UsbError::Timeout);
+        }
+
+        crate::time::delay_ms(10);
+
+        // Set 64-bit segment selector to 0 (if supported)
+        if self.has_64bit {
+            self.write_op(0x10, 0); // CTRLDSSEGMENT
+        }
+
+        // Initialize async schedule list head (reclaim list head) using volatile writes
+        unsafe {
+            let qh = self.async_qh as *mut Qh;
+            // Point to self (circular list with just the head)
+            ptr::write_volatile(&mut (*qh).qh_link, (self.async_qh as u32) | Qh::TYPE_QH);
+            // Head of reclaim list, high speed
+            ptr::write_volatile(&mut (*qh).ep_chars, Qh::EP_HEAD | Qh::EP_EPS_HIGH);
+            ptr::write_volatile(&mut (*qh).ep_caps, 1 << Qh::CAP_MULT_SHIFT);
+            ptr::write_volatile(&mut (*qh).current_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qh).overlay.next_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qh).overlay.alt_next_qtd, Qtd::TERMINATE);
+            // Halted so HC won't try to process the head
+            ptr::write_volatile(&mut (*qh).overlay.token, Qtd::TOKEN_STATUS_HALTED);
+        }
+        fence(Ordering::SeqCst);
+
+        // Flush async head to main memory for DMA
+        flush_cache_range(self.async_qh, 96);
+
+        // Set async list address
+        self.write_op(0x18, self.async_qh as u32); // ASYNCLISTADDR
+
+        // Initialize periodic frame list (all terminate)
+        let frame_list = self.periodic_list as *mut u32;
+        for i in 0..Self::FRAME_LIST_SIZE {
             unsafe {
-                ptr::write_volatile(periodic.add(i), (self.async_qh as u32) | 2);
-                // QH type
+                ptr::write_volatile(frame_list.add(i), Qh::TERMINATE);
             }
         }
 
-        // Disable interrupts
-        self.write_op_reg(op_regs::USBINTR, 0);
-
-        // Disable periodic schedule first
-        let _ = self.set_periodic_schedule(false);
+        // Flush periodic list to main memory
+        flush_cache_range(self.periodic_list, Self::FRAME_LIST_SIZE * 4);
 
         // Set periodic frame list base
-        self.write_op_reg(op_regs::PERIODICLISTBASE, self.periodic_list as u32);
+        self.write_op(0x14, self.periodic_list as u32); // PERIODICLISTBASE
 
-        // Enable periodic schedule
-        let _ = self.set_periodic_schedule(true);
+        // Clear status bits
+        self.write_op(0x04, 0x3F); // USBSTS - clear all
 
-        // Wait for ports to stabilize
+        // Disable interrupts (we poll)
+        self.write_op(0x08, 0); // USBINTR
+
+        // Start the controller
+        let cmd = usbcmd::RS | usbcmd::ITC_8;
+        self.write_op(0x00, cmd);
+
+        // Wait for running
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if (self.read_op(0x04) & usbsts::HCHALTED) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        if (self.read_op(0x04) & usbsts::HCHALTED) != 0 {
+            log::error!("EHCI: Controller did not start");
+            return Err(UsbError::Timeout);
+        }
+
+        // Set Configure Flag - route all ports to EHCI
+        self.write_op(0x40, configflag::CF); // CONFIGFLAG
+
         crate::time::delay_ms(100);
 
         log::info!("EHCI controller initialized");
         Ok(())
     }
 
-    /// Enumerate ports and attach devices
+    /// Enumerate ports
     fn enumerate_ports(&mut self) -> Result<(), UsbError> {
-        for port in 0..self.num_ports {
-            let portsc = self.read_port_reg(port);
+        log::trace!("EHCI: Enumerating {} ports", self.num_ports);
 
-            // Check if device connected
-            if portsc & portsc::CCS == 0 {
+        for port in 0..self.num_ports {
+            let portsc = self.read_portsc(port);
+
+            // Clear status change bits
+            self.write_portsc(port, portsc | portsc::WC_BITS);
+
+            if (portsc & portsc::CCS) == 0 {
                 continue;
             }
 
-            // Check line state - if K-state, it's a low-speed device
-            // that should be handled by companion controller
+            // Check line status - if it's K-state (Low Speed), release to companion
             let line_status = portsc & portsc::LS_MASK;
-            if line_status == portsc::LS_KSTATE {
-                log::debug!("Port {}: Low-speed device, releasing to companion", port);
-                // Release to companion controller
-                self.write_port_reg(port, portsc | portsc::PO);
+            if line_status == portsc::LS_K {
+                log::debug!(
+                    "EHCI: Port {} has low-speed device, releasing to companion",
+                    port
+                );
+                self.write_portsc(port, portsc | portsc::PO);
                 continue;
             }
 
             log::info!("EHCI: Device detected on port {}", port);
 
             // Reset the port
-            let portsc = self.read_port_reg(port);
-            self.write_port_reg(port, (portsc & !portsc::PE) | portsc::PR);
+            let portsc = self.read_portsc(port);
+            self.write_portsc(port, (portsc | portsc::PR) & !portsc::PE);
 
-            crate::time::delay_ms(50); // USB spec requires at least 50ms reset
+            crate::time::delay_ms(50); // USB spec: 10-20ms reset, we use 50ms
 
             // Clear reset
-            let portsc = self.read_port_reg(port);
-            self.write_port_reg(port, portsc & !portsc::PR);
+            let portsc = self.read_portsc(port);
+            self.write_portsc(port, portsc & !portsc::PR);
 
             crate::time::delay_ms(10);
 
-            // Check if port is now enabled (high-speed device)
-            let portsc = self.read_port_reg(port);
-            if portsc & portsc::PE == 0 {
-                // Not high-speed, release to companion
-                log::debug!("Port {}: Full-speed device, releasing to companion", port);
-                self.write_port_reg(port, portsc | portsc::PO);
+            // Wait for enable
+            let timeout = Timeout::from_ms(100);
+            let mut enabled = false;
+            while !timeout.is_expired() {
+                let portsc = self.read_portsc(port);
+                if (portsc & portsc::PE) != 0 {
+                    enabled = true;
+                    break;
+                }
+                if (portsc & portsc::CCS) == 0 {
+                    // Device disconnected during reset
+                    break;
+                }
+                crate::time::delay_ms(1);
+            }
+
+            if !enabled {
+                let portsc = self.read_portsc(port);
+                // Check if it's a full-speed device (should go to companion)
+                if (portsc & portsc::CCS) != 0 && (portsc & portsc::PE) == 0 {
+                    log::debug!(
+                        "EHCI: Port {} has full-speed device, releasing to companion",
+                        port
+                    );
+                    self.write_portsc(port, portsc | portsc::PO);
+                }
                 continue;
             }
 
             // Clear status change bits
-            self.write_port_reg(port, portsc | portsc::W1C_MASK);
+            let portsc = self.read_portsc(port);
+            self.write_portsc(port, portsc | portsc::WC_BITS);
 
-            // Enumerate the device
-            if let Err(e) = self.attach_device(port) {
+            // Device is high-speed if enabled on EHCI
+            if let Err(e) = self.attach_device(port, UsbSpeed::High) {
                 log::error!("Failed to attach device on port {}: {:?}", port, e);
             }
         }
@@ -728,24 +962,21 @@ impl EhciController {
     }
 
     /// Attach a device on a port
-    fn attach_device(&mut self, port: u8) -> Result<(), UsbError> {
-        // Allocate device address
+    fn attach_device(&mut self, port: u8, speed: UsbSpeed) -> Result<(), UsbError> {
         let address = self.next_address;
         if address >= 128 {
             return Err(UsbError::NoFreeSlots);
         }
 
-        // Find a free slot
         let slot = self
             .devices
             .iter()
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        // Create device with address 0 initially
-        let mut device = EhciDevice::new(0, port, UsbSpeed::High);
+        let mut device = EhciDevice::new(0, port, speed);
 
-        // Get device descriptor (first 8 bytes) to determine max packet size
+        // Get initial device descriptor (first 8 bytes)
         let mut desc_buf = [0u8; 8];
         self.control_transfer_internal(
             &device,
@@ -758,7 +989,7 @@ impl EhciController {
 
         device.ep0_max_packet = desc_buf[7].max(8) as u16;
 
-        // Set device address
+        // Set address
         self.control_transfer_internal(
             &device,
             req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
@@ -768,8 +999,7 @@ impl EhciController {
             None,
         )?;
 
-        crate::time::delay_ms(2); // USB spec SET_ADDRESS recovery time
-
+        crate::time::delay_ms(2);
         device.address = address;
         self.next_address += 1;
 
@@ -787,17 +1017,9 @@ impl EhciController {
         device.device_desc =
             unsafe { ptr::read_unaligned(desc_buf.as_ptr() as *const DeviceDescriptor) };
 
-        let vid = device.device_desc.vendor_id;
-        let pid = device.device_desc.product_id;
-        let dev_class = device.device_desc.device_class;
-
-        log::info!(
-            "  Device {}: VID={:04x} PID={:04x} Class={:02x}",
-            address,
-            vid,
-            pid,
-            dev_class
-        );
+        let vid = { device.device_desc.vendor_id };
+        let pid = { device.device_desc.product_id };
+        log::info!("  Device {}: VID={:04x} PID={:04x}", address, vid, pid);
 
         // Get configuration descriptor
         let mut config_buf = [0u8; 256];
@@ -824,20 +1046,19 @@ impl EhciController {
             Some(&mut config_buf[..total_len]),
         )?;
 
-        // Parse configuration
         device.config_info = parse_configuration(&config_buf[..total_len]);
 
-        // Find mass storage or HID interface
+        // Find interfaces
         for iface in &device.config_info.interfaces[..device.config_info.num_interfaces] {
             if iface.is_mass_storage() {
                 device.is_mass_storage = true;
                 device.bulk_in = iface.find_bulk_in().cloned();
                 device.bulk_out = iface.find_bulk_out().cloned();
-                log::info!("    Mass Storage interface found");
+                log::info!("    Mass Storage interface");
             } else if iface.is_hid_keyboard() {
                 device.is_hid_keyboard = true;
                 device.interrupt_in = iface.find_interrupt_in().cloned();
-                log::info!("    HID Keyboard interface found");
+                log::info!("    HID Keyboard interface");
             }
         }
 
@@ -857,7 +1078,7 @@ impl EhciController {
         Ok(())
     }
 
-    /// Internal control transfer (doesn't require mutable device)
+    /// Perform a control transfer
     fn control_transfer_internal(
         &mut self,
         device: &EhciDevice,
@@ -870,132 +1091,559 @@ impl EhciController {
         let is_in = (request_type & 0x80) != 0;
         let data_len = data.as_ref().map(|d| d.len()).unwrap_or(0);
 
-        // Build setup packet in DMA buffer
-        let setup_packet = self.dma_buffer as *mut [u8; 8];
+        log::trace!(
+            "EHCI: control_transfer dev={} req={:#x} val={:#x} len={}",
+            device.address,
+            request,
+            value,
+            data_len
+        );
+
+        // Set up buffers - all must be below 4GB
+        let setup_addr = self.dma_buffer;
+        let data_addr = setup_addr + 64;
+        let qh_addr = self.qh_pool + 64; // Use offset to avoid the async head
+        let qtd_setup_addr = self.qtd_pool;
+        let qtd_data_addr = qtd_setup_addr + 64;
+        let qtd_status_addr = qtd_data_addr + 64;
+
+        // Validate addresses are below 4GB (EHCI uses 32-bit addresses)
+        debug_assert!(setup_addr < 0x1_0000_0000, "setup_addr above 4GB");
+        debug_assert!(qh_addr < 0x1_0000_0000, "qh_addr above 4GB");
+        debug_assert!(qtd_setup_addr < 0x1_0000_0000, "qtd_setup_addr above 4GB");
+
+        // Clear the memory regions first using volatile writes
         unsafe {
-            (*setup_packet)[0] = request_type;
-            (*setup_packet)[1] = request;
-            (*setup_packet)[2] = value as u8;
-            (*setup_packet)[3] = (value >> 8) as u8;
-            (*setup_packet)[4] = index as u8;
-            (*setup_packet)[5] = (index >> 8) as u8;
-            (*setup_packet)[6] = data_len as u8;
-            (*setup_packet)[7] = (data_len >> 8) as u8;
+            ptr::write_bytes(qh_addr as *mut u8, 0, 64);
+            ptr::write_bytes(qtd_setup_addr as *mut u8, 0, 64);
+            ptr::write_bytes(qtd_data_addr as *mut u8, 0, 64);
+            ptr::write_bytes(qtd_status_addr as *mut u8, 0, 64);
+        }
+        fence(Ordering::SeqCst);
+
+        // Build setup packet (8 bytes)
+        unsafe {
+            let setup = setup_addr as *mut u8;
+            *setup.add(0) = request_type;
+            *setup.add(1) = request;
+            *setup.add(2) = value as u8;
+            *setup.add(3) = (value >> 8) as u8;
+            *setup.add(4) = index as u8;
+            *setup.add(5) = (index >> 8) as u8;
+            *setup.add(6) = data_len as u8;
+            *setup.add(7) = (data_len >> 8) as u8;
         }
 
-        // Allocate QH and qTDs
-        let qh_addr = self.dma_buffer + 64; // After setup packet
-        let qtd_base = qh_addr + 64; // After QH
-        let data_buffer = qtd_base + 256; // After qTDs
-
-        // Copy data to DMA buffer for OUT transfers
+        // Copy OUT data
         if let Some(ref d) = data {
             if !is_in {
                 unsafe {
-                    ptr::copy_nonoverlapping(d.as_ptr(), data_buffer as *mut u8, d.len());
+                    ptr::copy_nonoverlapping(d.as_ptr(), data_addr as *mut u8, d.len());
                 }
             }
         }
 
-        // Create QH
-        let qh = unsafe { &mut *(qh_addr as *mut QueueHead) };
-        *qh = QueueHead::new(device.address, 0, device.ep0_max_packet, device.speed, true);
+        // Build qTDs using volatile writes - work backwards from status to setup
+        // Status qTD (last in chain)
+        let status_token = Qtd::TOKEN_STATUS_ACTIVE
+            | (if is_in {
+                Qtd::TOKEN_PID_OUT
+            } else {
+                Qtd::TOKEN_PID_IN
+            })
+            | Qtd::TOKEN_TOGGLE
+            | Qtd::TOKEN_IOC
+            | (3 << Qtd::TOKEN_CERR_SHIFT)
+            | (0 << Qtd::TOKEN_BYTES_SHIFT); // Zero length status
 
-        // Create qTDs
-        let setup_qtd = unsafe { &mut *(qtd_base as *mut QueueTransferDescriptor) };
-        let setup_array = unsafe { &*(self.dma_buffer as *const [u8; 8]) };
-        *setup_qtd = QueueTransferDescriptor::setup(setup_array, false);
-
-        let mut qtd_count = 1;
-
-        if data_len > 0 {
-            let data_qtd = unsafe { &mut *((qtd_base + 32) as *mut QueueTransferDescriptor) };
-            *data_qtd =
-                QueueTransferDescriptor::data(data_buffer as *mut u8, data_len, is_in, true);
-            setup_qtd.next_qtd = (qtd_base + 32) as u32;
-            qtd_count = 2;
+        unsafe {
+            let qtd_status = qtd_status_addr as *mut Qtd;
+            ptr::write_volatile(&mut (*qtd_status).next_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qtd_status).alt_next_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qtd_status).token, status_token);
         }
 
-        let status_qtd =
-            unsafe { &mut *((qtd_base + qtd_count * 32) as *mut QueueTransferDescriptor) };
-        *status_qtd = QueueTransferDescriptor::status(!is_in || data_len == 0);
-
+        // Data qTD (if needed)
         if data_len > 0 {
-            let data_qtd = unsafe { &mut *((qtd_base + 32) as *mut QueueTransferDescriptor) };
-            data_qtd.next_qtd = (qtd_base + qtd_count * 32) as u32;
+            let data_token = Qtd::TOKEN_STATUS_ACTIVE
+                | (if is_in {
+                    Qtd::TOKEN_PID_IN
+                } else {
+                    Qtd::TOKEN_PID_OUT
+                })
+                | Qtd::TOKEN_TOGGLE
+                | (3 << Qtd::TOKEN_CERR_SHIFT)
+                | ((data_len as u32) << Qtd::TOKEN_BYTES_SHIFT);
+
+            unsafe {
+                let qtd_data = qtd_data_addr as *mut Qtd;
+                ptr::write_volatile(&mut (*qtd_data).next_qtd, qtd_status_addr as u32);
+                ptr::write_volatile(&mut (*qtd_data).alt_next_qtd, Qtd::TERMINATE);
+                ptr::write_volatile(&mut (*qtd_data).token, data_token);
+                // Set buffer pointers
+                (*qtd_data).set_buffers(data_addr, data_len);
+            }
+        }
+
+        // Setup qTD (first in chain)
+        let setup_next = if data_len > 0 {
+            qtd_data_addr as u32
         } else {
-            setup_qtd.next_qtd = (qtd_base + qtd_count * 32) as u32;
+            qtd_status_addr as u32
+        };
+        let setup_token = Qtd::TOKEN_STATUS_ACTIVE
+            | Qtd::TOKEN_PID_SETUP
+            | (3 << Qtd::TOKEN_CERR_SHIFT)
+            | (8 << Qtd::TOKEN_BYTES_SHIFT); // Setup is always 8 bytes
+
+        unsafe {
+            let qtd_setup = qtd_setup_addr as *mut Qtd;
+            ptr::write_volatile(&mut (*qtd_setup).next_qtd, setup_next);
+            ptr::write_volatile(&mut (*qtd_setup).alt_next_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qtd_setup).token, setup_token);
+            (*qtd_setup).set_buffers(setup_addr, 8);
         }
 
-        // Link QH to async schedule
-        qh.overlay.next_qtd = qtd_base as u32;
-        qh.cur_qtd = 0;
+        // Build QH for this transfer using volatile writes
+        let mut ep_chars = (device.address as u32 & Qh::EP_DEVADDR_MASK)
+            | (0 << Qh::EP_ENDPT_SHIFT) // Endpoint 0
+            | Qh::EP_DTC // Data toggle from qTD
+            | ((device.ep0_max_packet as u32) << Qh::EP_MAXPKT_SHIFT)
+            | (8 << Qh::EP_RL_SHIFT); // NAK reload = 8
 
-        // Make QH point to itself (circular) with H flag (head of reclamation list)
-        qh.horiz_link_ptr = (qh_addr as u32) | 2; // QH type, points to self
-        qh.ep_chars |= 1 << 15; // H flag - head of reclamation list
+        // Set endpoint speed
+        ep_chars |= match device.speed {
+            UsbSpeed::Low => Qh::EP_EPS_LOW,
+            UsbSpeed::Full => Qh::EP_EPS_FULL,
+            _ => Qh::EP_EPS_HIGH,
+        };
+
+        // Control Endpoint Flag (C) - ONLY set for non-high-speed control endpoints
+        // For high-speed devices, this must ALWAYS be zero per EHCI spec section 3.6.2
+        if device.speed != UsbSpeed::High {
+            ep_chars |= Qh::EP_CTRL;
+        }
+
+        let ep_caps = 1u32 << Qh::CAP_MULT_SHIFT; // High bandwidth pipe multiplier = 1
+
+        unsafe {
+            let qh = qh_addr as *mut Qh;
+            ptr::write_volatile(&mut (*qh).ep_chars, ep_chars);
+            ptr::write_volatile(&mut (*qh).ep_caps, ep_caps);
+            // Set current_qtd to TERMINATE (T-bit=1) so HC uses overlay.next_qtd
+            ptr::write_volatile(&mut (*qh).current_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qh).overlay.next_qtd, qtd_setup_addr as u32);
+            ptr::write_volatile(&mut (*qh).overlay.alt_next_qtd, Qtd::TERMINATE);
+            ptr::write_volatile(&mut (*qh).overlay.token, 0); // ACTIVE=0, HALTED=0 -> fetch qTD
+                                                              // Clear rest of overlay
+            for i in 0..5 {
+                ptr::write_volatile(&mut (*qh).overlay.buffer[i], 0);
+                ptr::write_volatile(&mut (*qh).overlay.buffer_hi[i], 0);
+            }
+        }
+
         fence(Ordering::SeqCst);
 
-        // Disable async schedule first (following libpayload pattern)
-        let _ = self.set_async_schedule(false);
+        // Flush setup packet data to main memory
+        flush_cache_range(setup_addr, 8);
+        if data_len > 0 && !is_in {
+            flush_cache_range(data_addr, data_len);
+        }
 
-        // Set async list address to our QH
-        self.write_op_reg(op_regs::ASYNCLISTADDR, qh_addr as u32);
+        // Flush qTDs to main memory so EHCI can see them
+        flush_cache_range(qtd_setup_addr, 64);
+        if data_len > 0 {
+            flush_cache_range(qtd_data_addr, 64);
+        }
+        flush_cache_range(qtd_status_addr, 64);
+
+        // Flush QH to main memory
+        flush_cache_range(qh_addr, 96);
+
+        // Link QH into async schedule (insert after async head) using volatile
+        let old_link = unsafe { ptr::read_volatile(&(*(self.async_qh as *const Qh)).qh_link) };
+
+        unsafe {
+            let qh = qh_addr as *mut Qh;
+            ptr::write_volatile(&mut (*qh).qh_link, old_link);
+        }
+
+        // Flush the QH link field
+        flush_cache_range(qh_addr, 4);
+
+        // Now link our QH into the schedule
+        unsafe {
+            let async_qh = self.async_qh as *mut Qh;
+            ptr::write_volatile(&mut (*async_qh).qh_link, (qh_addr as u32) | Qh::TYPE_QH);
+        }
+
+        // Flush the async head's link to make it visible to HC
+        flush_cache_range(self.async_qh, 4);
+
+        // Read back for debug
+        let async_link = unsafe { ptr::read_volatile(&(*(self.async_qh as *const Qh)).qh_link) };
+        let qh_ep_chars = unsafe { ptr::read_volatile(&(*(qh_addr as *const Qh)).ep_chars) };
+        let qh_current = unsafe { ptr::read_volatile(&(*(qh_addr as *const Qh)).current_qtd) };
+        let qh_overlay_next =
+            unsafe { ptr::read_volatile(&(*(qh_addr as *const Qh)).overlay.next_qtd) };
+        let qh_overlay_token =
+            unsafe { ptr::read_volatile(&(*(qh_addr as *const Qh)).overlay.token) };
+        let qtd_buffer0 =
+            unsafe { ptr::read_volatile(&(*(qtd_setup_addr as *const Qtd)).buffer[0]) };
+
+        log::debug!(
+            "EHCI: QH@{:#x} async_head@{:#x} async_head.link={:#x}",
+            qh_addr,
+            self.async_qh,
+            async_link
+        );
+        log::debug!(
+            "EHCI: QH.ep_chars={:#x} current_qtd={:#x} overlay.next={:#x} overlay.token={:#x}",
+            qh_ep_chars,
+            qh_current,
+            qh_overlay_next,
+            qh_overlay_token
+        );
+        log::debug!(
+            "EHCI: setup_qtd@{:#x} buffer[0]={:#x}",
+            qtd_setup_addr,
+            qtd_buffer0
+        );
+        log::debug!(
+            "EHCI: ASYNCLISTADDR={:#x}, USBCMD={:#x}",
+            self.read_op(0x18),
+            self.read_op(0x00)
+        );
+        log::debug!(
+            "EHCI: QH.ep_chars={:#x}, QH.overlay.next_qtd={:#x}",
+            qh_ep_chars,
+            qh_overlay_next
+        );
+        log::debug!(
+            "EHCI: ASYNCLISTADDR={:#x}, USBCMD={:#x}",
+            self.read_op(0x18),
+            self.read_op(0x00)
+        );
+
+        // Enable async schedule if not already
+        let cmd = self.read_op(0x00);
+        if (cmd & usbcmd::ASE) == 0 {
+            self.write_op(0x00, cmd | usbcmd::ASE);
+
+            // Wait for async schedule to become active
+            let timeout = Timeout::from_ms(100);
+            while !timeout.is_expired() {
+                if (self.read_op(0x04) & usbsts::ASS) != 0 {
+                    break;
+                }
+                crate::time::delay_us(10);
+            }
+
+            if (self.read_op(0x04) & usbsts::ASS) == 0 {
+                log::error!("EHCI: Async schedule failed to start");
+                // Unlink and return error
+                unsafe {
+                    let async_qh = self.async_qh as *mut Qh;
+                    ptr::write_volatile(&mut (*async_qh).qh_link, old_link);
+                }
+                return Err(UsbError::Timeout);
+            }
+            log::debug!(
+                "EHCI: Async schedule enabled, ASS={}",
+                (self.read_op(0x04) & usbsts::ASS) != 0
+            );
+        }
+
+        // Wait for transfer completion using volatile reads
+        let timeout = Timeout::from_ms(5000);
+        let mut poll_count = 0u32;
+        while !timeout.is_expired() {
+            // Invalidate cache to see updates from EHCI DMA
+            invalidate_cache_range(qtd_setup_addr, 64);
+            invalidate_cache_range(qtd_status_addr, 64);
+            if data_len > 0 {
+                invalidate_cache_range(qtd_data_addr, 64);
+            }
+
+            fence(Ordering::SeqCst);
+
+            // Read qTD tokens using volatile
+            let setup_token =
+                unsafe { ptr::read_volatile(&(*(qtd_setup_addr as *const Qtd)).token) };
+            let status_token =
+                unsafe { ptr::read_volatile(&(*(qtd_status_addr as *const Qtd)).token) };
+
+            // Check if setup qTD completed (ACTIVE bit cleared)
+            if (setup_token & Qtd::TOKEN_STATUS_ACTIVE) == 0 {
+                // Setup done, check if we need to wait for data/status
+                if data_len > 0 {
+                    let data_token =
+                        unsafe { ptr::read_volatile(&(*(qtd_data_addr as *const Qtd)).token) };
+                    if (data_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
+                        poll_count += 1;
+                        if poll_count % 100000 == 0 {
+                            log::trace!("EHCI: waiting for data qTD, token={:#x}", data_token);
+                        }
+                        crate::time::delay_us(1);
+                        continue;
+                    }
+                }
+                if (status_token & Qtd::TOKEN_STATUS_ACTIVE) == 0 {
+                    break; // All done
+                }
+            }
+
+            poll_count += 1;
+            if poll_count % 100000 == 0 {
+                log::trace!(
+                    "EHCI: waiting, setup_token={:#x} status_token={:#x} usbsts={:#x}",
+                    setup_token,
+                    status_token,
+                    self.read_op(0x04)
+                );
+            }
+            crate::time::delay_us(1);
+        }
+
+        // Unlink QH from schedule
+        unsafe {
+            let async_qh = self.async_qh as *mut Qh;
+            ptr::write_volatile(&mut (*async_qh).qh_link, old_link);
+        }
         fence(Ordering::SeqCst);
 
-        // Enable async schedule and wait for it to start
-        if self.set_async_schedule(true).is_err() {
+        // Ring doorbell and wait for async advance
+        self.write_op(0x04, usbsts::IAA); // Clear any pending IAA
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd | usbcmd::IAAD);
+
+        let timeout2 = Timeout::from_ms(100);
+        while !timeout2.is_expired() {
+            if (self.read_op(0x04) & usbsts::IAA) != 0 {
+                self.write_op(0x04, usbsts::IAA); // Clear
+                break;
+            }
+            crate::time::delay_us(10);
+        }
+
+        // Invalidate caches one more time to get final state
+        invalidate_cache_range(qtd_setup_addr, 64);
+        invalidate_cache_range(qtd_status_addr, 64);
+        if data_len > 0 {
+            invalidate_cache_range(qtd_data_addr, 64);
+            if is_in {
+                invalidate_cache_range(data_addr, data_len);
+            }
+        }
+
+        // Check results using volatile reads
+        let final_setup_token =
+            unsafe { ptr::read_volatile(&(*(qtd_setup_addr as *const Qtd)).token) };
+        let final_status_token =
+            unsafe { ptr::read_volatile(&(*(qtd_status_addr as *const Qtd)).token) };
+
+        if (final_status_token & Qtd::TOKEN_STATUS_ACTIVE) != 0 {
+            log::error!(
+                "EHCI: transfer timeout, setup={:#x} status={:#x}",
+                final_setup_token,
+                final_status_token
+            );
             return Err(UsbError::Timeout);
+        }
+
+        // Check for errors (HALTED, BABBLE, BUFFER_ERR, XACT_ERR)
+        const ERROR_MASK: u32 = Qtd::TOKEN_STATUS_HALTED
+            | Qtd::TOKEN_STATUS_BUFFER_ERR
+            | Qtd::TOKEN_STATUS_BABBLE
+            | Qtd::TOKEN_STATUS_XACT_ERR;
+
+        if (final_setup_token & ERROR_MASK) != 0 || (final_status_token & ERROR_MASK) != 0 {
+            if (final_setup_token & Qtd::TOKEN_STATUS_HALTED) != 0
+                || (final_status_token & Qtd::TOKEN_STATUS_HALTED) != 0
+            {
+                return Err(UsbError::Stall);
+            }
+            return Err(UsbError::TransactionError);
+        }
+
+        if data_len > 0 {
+            let final_data_token =
+                unsafe { ptr::read_volatile(&(*(qtd_data_addr as *const Qtd)).token) };
+
+            if (final_data_token & ERROR_MASK) != 0 {
+                if (final_data_token & Qtd::TOKEN_STATUS_HALTED) != 0 {
+                    return Err(UsbError::Stall);
+                }
+                return Err(UsbError::TransactionError);
+            }
+
+            // Copy IN data
+            if let Some(d) = data {
+                if is_in {
+                    // Calculate bytes transferred: original - remaining
+                    let remaining = ((final_data_token & Qtd::TOKEN_BYTES_MASK)
+                        >> Qtd::TOKEN_BYTES_SHIFT) as usize;
+                    let transferred = data_len.saturating_sub(remaining);
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            data_addr as *const u8,
+                            d.as_mut_ptr(),
+                            transferred.min(d.len()),
+                        );
+                    }
+                    log::trace!("EHCI: control transfer complete, {} bytes", transferred);
+                    return Ok(transferred);
+                }
+            }
+        }
+
+        log::trace!("EHCI: control transfer complete (no data phase)");
+        Ok(data_len)
+    }
+
+    /// Perform a bulk transfer
+    fn bulk_transfer_internal(
+        &mut self,
+        device: &EhciDevice,
+        endpoint: u8,
+        is_in: bool,
+        data: &mut [u8],
+        toggle: bool,
+    ) -> Result<(usize, bool), UsbError> {
+        let max_packet = if is_in {
+            device
+                .bulk_in
+                .as_ref()
+                .map(|e| e.max_packet_size)
+                .unwrap_or(512)
+        } else {
+            device
+                .bulk_out
+                .as_ref()
+                .map(|e| e.max_packet_size)
+                .unwrap_or(512)
+        };
+
+        // Use DMA buffer
+        let data_addr = self.dma_buffer;
+        let qh_addr = self.qh_pool + 128;
+        let qtd_addr = self.qtd_pool + 256;
+
+        // Copy OUT data
+        if !is_in {
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), data_addr as *mut u8, data.len());
+            }
+        }
+
+        // Build qTD
+        let qtd = unsafe { &mut *(qtd_addr as *mut Qtd) };
+        *qtd = Qtd::new();
+        qtd.token = Qtd::TOKEN_STATUS_ACTIVE
+            | (if is_in {
+                Qtd::TOKEN_PID_IN
+            } else {
+                Qtd::TOKEN_PID_OUT
+            })
+            | (if toggle { Qtd::TOKEN_TOGGLE } else { 0 })
+            | Qtd::TOKEN_IOC
+            | (3 << Qtd::TOKEN_CERR_SHIFT)
+            | ((data.len() as u32) << Qtd::TOKEN_BYTES_SHIFT);
+        qtd.set_buffers(data_addr, data.len());
+
+        // Build QH
+        let qh = unsafe { &mut *(qh_addr as *mut Qh) };
+        *qh = Qh::new();
+        qh.configure(device.address, endpoint, max_packet, device.speed, false);
+        qh.overlay.next_qtd = qtd_addr as u32;
+        qh.overlay.alt_next_qtd = Qtd::TERMINATE;
+        qh.overlay.token = 0;
+
+        fence(Ordering::SeqCst);
+
+        // Link QH into async schedule
+        let async_qh = unsafe { &mut *(self.async_qh as *mut Qh) };
+        let old_link = async_qh.qh_link;
+        qh.qh_link = old_link;
+        async_qh.qh_link = (qh_addr as u32) | Qh::TYPE_QH;
+
+        fence(Ordering::SeqCst);
+
+        // Enable async schedule
+        let cmd = self.read_op(0x00);
+        if (cmd & usbcmd::ASE) == 0 {
+            self.write_op(0x00, cmd | usbcmd::ASE);
+            let timeout = Timeout::from_ms(100);
+            while !timeout.is_expired() {
+                if (self.read_op(0x04) & usbsts::ASS) != 0 {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
         }
 
         // Wait for completion
         let timeout = Timeout::from_ms(5000);
         while !timeout.is_expired() {
             fence(Ordering::SeqCst);
-            if status_qtd.is_complete() {
+            if !qtd.is_active() {
                 break;
             }
-            crate::time::delay_ms(1);
+            core::hint::spin_loop();
         }
 
-        // Disable async schedule
-        let _ = self.set_async_schedule(false);
+        // Unlink QH
+        async_qh.qh_link = old_link;
+        fence(Ordering::SeqCst);
 
-        // Check for errors
-        if !status_qtd.is_complete() {
+        // Ring doorbell
+        self.write_op(0x04, usbsts::IAA);
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd | usbcmd::IAAD);
+
+        let timeout2 = Timeout::from_ms(100);
+        while !timeout2.is_expired() {
+            if (self.read_op(0x04) & usbsts::IAA) != 0 {
+                self.write_op(0x04, usbsts::IAA);
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Check results
+        if qtd.is_active() {
             return Err(UsbError::Timeout);
         }
 
-        if status_qtd.has_error() || setup_qtd.has_error() {
-            if status_qtd.token & QueueTransferDescriptor::TOKEN_HALTED != 0 {
+        if qtd.has_error() {
+            if qtd.is_halted() {
                 return Err(UsbError::Stall);
             }
             return Err(UsbError::TransactionError);
         }
 
-        // Copy data back for IN transfers
-        if let Some(d) = data {
-            if is_in {
-                let data_qtd = unsafe { &*((qtd_base + 32) as *const QueueTransferDescriptor) };
-                let transferred = data_qtd.bytes_transferred(d.len());
-                unsafe {
-                    ptr::copy_nonoverlapping(data_buffer as *const u8, d.as_mut_ptr(), transferred);
-                }
-                return Ok(transferred);
+        let transferred = qtd.bytes_transferred(data.len());
+
+        // Toggle flips for each max-packet-sized transaction
+        let packets = (transferred + max_packet as usize - 1) / max_packet as usize;
+        let new_toggle = if packets % 2 == 1 { !toggle } else { toggle };
+
+        // Copy IN data
+        if is_in {
+            unsafe {
+                ptr::copy_nonoverlapping(data_addr as *const u8, data.as_mut_ptr(), transferred);
             }
         }
 
-        Ok(data_len)
+        Ok((transferred, new_toggle))
     }
 
-    /// Get mutable device reference
     fn get_device_mut(&mut self, address: u8) -> Option<&mut EhciDevice> {
         self.devices
             .iter_mut()
             .find_map(|d| d.as_mut().filter(|d| d.address == address))
     }
 
-    /// Get device reference
     fn get_device(&self, address: u8) -> Option<&EhciDevice> {
         self.devices
             .iter()
@@ -1006,7 +1654,45 @@ impl EhciController {
     pub fn pci_address(&self) -> PciAddress {
         self.pci_address
     }
+
+    /// Clean up the controller before handing off to the OS
+    pub fn cleanup(&mut self) {
+        log::debug!("EHCI cleanup: stopping controller");
+
+        // Disable schedules
+        let cmd = self.read_op(0x00);
+        self.write_op(0x00, cmd & !(usbcmd::ASE | usbcmd::PSE | usbcmd::RS));
+
+        // Wait for halt
+        let timeout = Timeout::from_ms(100);
+        while !timeout.is_expired() {
+            if (self.read_op(0x04) & usbsts::HCHALTED) != 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Reset
+        self.write_op(0x00, usbcmd::HCRESET);
+
+        let timeout = Timeout::from_ms(250);
+        while !timeout.is_expired() {
+            if (self.read_op(0x00) & usbcmd::HCRESET) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Clear configure flag
+        self.write_op(0x40, 0);
+
+        log::debug!("EHCI cleanup complete");
+    }
 }
+
+// ============================================================================
+// UsbController Implementation
+// ============================================================================
 
 impl UsbController for EhciController {
     fn controller_type(&self) -> &'static str {
@@ -1023,6 +1709,7 @@ impl UsbController for EhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
+        // Clone the relevant fields to avoid borrow issues
         let dev_copy = EhciDevice {
             address: dev.address,
             port: dev.port,
@@ -1048,104 +1735,44 @@ impl UsbController for EhciController {
         is_in: bool,
         data: &mut [u8],
     ) -> Result<usize, UsbError> {
+        log::trace!(
+            "EHCI: bulk_transfer dev={} ep={} is_in={} len={}",
+            device,
+            endpoint,
+            is_in,
+            data.len()
+        );
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-
-        let ep_info = if is_in {
-            dev.bulk_in.as_ref()
-        } else {
-            dev.bulk_out.as_ref()
-        }
-        .ok_or(UsbError::InvalidParameter)?;
-
-        let max_packet = ep_info.max_packet_size;
+        let dev_copy = EhciDevice {
+            address: dev.address,
+            port: dev.port,
+            speed: dev.speed,
+            device_desc: dev.device_desc.clone(),
+            config_info: dev.config_info.clone(),
+            is_mass_storage: dev.is_mass_storage,
+            is_hid_keyboard: dev.is_hid_keyboard,
+            bulk_in: dev.bulk_in.clone(),
+            bulk_out: dev.bulk_out.clone(),
+            interrupt_in: dev.interrupt_in.clone(),
+            ep0_max_packet: dev.ep0_max_packet,
+            bulk_in_toggle: dev.bulk_in_toggle,
+            bulk_out_toggle: dev.bulk_out_toggle,
+        };
         let toggle = if is_in {
             dev.bulk_in_toggle
         } else {
             dev.bulk_out_toggle
         };
 
-        // Allocate QH and qTD
-        let qh_addr = self.dma_buffer;
-        let qtd_addr = qh_addr + 64;
-        let data_buffer = qtd_addr + 64;
-
-        // Copy data for OUT
-        if !is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data.as_ptr(), data_buffer as *mut u8, data.len());
-            }
-        }
-
-        // Create QH
-        let qh = unsafe { &mut *(qh_addr as *mut QueueHead) };
-        *qh = QueueHead::new(dev.address, endpoint, max_packet, dev.speed, false);
-
-        // Create qTD
-        let qtd = unsafe { &mut *(qtd_addr as *mut QueueTransferDescriptor) };
-        *qtd = QueueTransferDescriptor::data(data_buffer as *mut u8, data.len(), is_in, toggle);
-        qtd.token |= 1 << 15; // IOC
-
-        qh.overlay.next_qtd = qtd_addr as u32;
-        qh.cur_qtd = 0;
-
-        // Make QH point to itself (circular) with H flag
-        qh.horiz_link_ptr = (qh_addr as u32) | 2; // QH type, points to self
-        qh.ep_chars |= 1 << 15; // H flag - head of reclamation list
-        fence(Ordering::SeqCst);
-
-        // Disable async schedule first (following libpayload pattern)
-        let _ = self.set_async_schedule(false);
-
-        // Set async list address to our QH
-        self.write_op_reg(op_regs::ASYNCLISTADDR, qh_addr as u32);
-        fence(Ordering::SeqCst);
-
-        // Enable async schedule and wait for it to start
-        if self.set_async_schedule(true).is_err() {
-            return Err(UsbError::Timeout);
-        }
-
-        // Wait for completion
-        let timeout = Timeout::from_ms(5000);
-        while !timeout.is_expired() {
-            fence(Ordering::SeqCst);
-            if qtd.is_complete() {
-                break;
-            }
-            crate::time::delay_ms(1);
-        }
-
-        // Disable async schedule
-        let _ = self.set_async_schedule(false);
-
-        // Check result
-        if !qtd.is_complete() {
-            return Err(UsbError::Timeout);
-        }
-
-        if qtd.has_error() {
-            if qtd.token & QueueTransferDescriptor::TOKEN_HALTED != 0 {
-                return Err(UsbError::Stall);
-            }
-            return Err(UsbError::TransactionError);
-        }
-
-        let transferred = qtd.bytes_transferred(data.len());
+        let (transferred, new_toggle) =
+            self.bulk_transfer_internal(&dev_copy, endpoint, is_in, data, toggle)?;
 
         // Update toggle
         if let Some(dev) = self.get_device_mut(device) {
-            let new_toggle = (qtd.token >> 31) != 0;
             if is_in {
-                dev.bulk_in_toggle = !new_toggle;
+                dev.bulk_in_toggle = new_toggle;
             } else {
-                dev.bulk_out_toggle = !new_toggle;
-            }
-        }
-
-        // Copy data for IN
-        if is_in {
-            unsafe {
-                ptr::copy_nonoverlapping(data_buffer as *const u8, data.as_mut_ptr(), transferred);
+                dev.bulk_out_toggle = new_toggle;
             }
         }
 
@@ -1205,61 +1832,5 @@ impl UsbController for EhciController {
 
     fn get_interrupt_endpoint(&self, device: u8) -> Option<EndpointInfo> {
         self.get_device(device).and_then(|d| d.interrupt_in.clone())
-    }
-}
-
-impl EhciController {
-    /// Clean up the controller before handing off to the OS
-    ///
-    /// This must be called before ExitBootServices to ensure Linux's EHCI
-    /// driver can properly initialize the controller. Following libpayload's
-    /// ehci_shutdown pattern.
-    pub fn cleanup(&mut self) {
-        log::debug!("EHCI cleanup: stopping controller");
-
-        // 1. Disable async schedule
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::ASE);
-
-        // Wait for async schedule to stop
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::ASS == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // 2. Disable periodic schedule
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::PSE);
-
-        // Wait for periodic schedule to stop
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::PSS == 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // 3. Stop the controller
-        let cmd = self.read_op_reg(op_regs::USBCMD);
-        self.write_op_reg(op_regs::USBCMD, cmd & !usbcmd::RS);
-
-        // Wait for halt
-        let timeout = Timeout::from_ms(100);
-        while !timeout.is_expired() {
-            if self.read_op_reg(op_regs::USBSTS) & usbsts::HCHALTED != 0 {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-
-        // 4. Give all ports back to companion controllers (OHCI/UHCI)
-        // This is critical - without this, Linux's EHCI driver may fail
-        self.write_op_reg(op_regs::CONFIGFLAG, 0);
-
-        log::debug!("EHCI cleanup complete");
     }
 }

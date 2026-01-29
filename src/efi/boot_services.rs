@@ -379,7 +379,7 @@ extern "efiapi" fn allocate_pool(
     size: usize,
     buffer: *mut *mut c_void,
 ) -> Status {
-    log::debug!("BS.AllocatePool(type={}, size={})", pool_type, size);
+    log::trace!("BS.AllocatePool(type={}, size={})", pool_type, size);
 
     if buffer.is_null() || size == 0 {
         return Status::INVALID_PARAMETER;
@@ -400,7 +400,7 @@ extern "efiapi" fn allocate_pool(
 }
 
 extern "efiapi" fn free_pool(buffer: *mut c_void) -> Status {
-    log::debug!("BS.FreePool({:?})", buffer);
+    log::trace!("BS.FreePool({:?})", buffer);
     if buffer.is_null() {
         return Status::INVALID_PARAMETER;
     }
@@ -1314,19 +1314,19 @@ extern "efiapi" fn open_protocol(
                     if !interface.is_null() {
                         unsafe { *interface = iface };
                     }
-                    log::debug!("  -> SUCCESS (interface={:?})", iface);
+                    log::trace!("  -> SUCCESS (interface={:?})", iface);
 
                     // For LOADED_IMAGE, log important fields
                     if guid_name == "LOADED_IMAGE" && !iface.is_null() {
                         let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
                         let dev_handle = unsafe { (*lip).device_handle };
                         let sys_table = unsafe { (*lip).system_table };
-                        log::debug!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
-                        log::debug!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
+                        log::trace!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
+                        log::trace!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
                         // Check if SystemTable looks valid
                         if !sys_table.is_null() {
                             let bs = unsafe { (*sys_table).boot_services };
-                            log::debug!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
+                            log::trace!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
                         } else {
                             log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
                         }
@@ -1334,7 +1334,7 @@ extern "efiapi" fn open_protocol(
                     return Status::SUCCESS;
                 }
             }
-            log::debug!("  -> UNSUPPORTED (protocol not on handle)");
+            log::trace!("  -> UNSUPPORTED (protocol not on handle)");
             return Status::UNSUPPORTED; // Handle exists but protocol not found
         }
     }
@@ -1484,13 +1484,13 @@ extern "efiapi" fn locate_protocol(
             if guid_eq(&handles[i].protocols[j].guid, &guid) {
                 let iface = handles[i].protocols[j].interface;
                 unsafe { *interface = iface };
-                log::debug!("  -> SUCCESS (interface={:p})", iface);
+                log::trace!("  -> SUCCESS (interface={:p})", iface);
                 return Status::SUCCESS;
             }
         }
     }
 
-    log::debug!("  -> NOT_FOUND");
+    log::trace!("  -> NOT_FOUND");
     Status::NOT_FOUND
 }
 
@@ -1579,7 +1579,7 @@ extern "efiapi" fn install_multiple_protocol_interfaces(
         }
     }
 
-    log::debug!("  -> SUCCESS");
+    log::trace!("  -> SUCCESS");
     Status::SUCCESS
 }
 
@@ -1636,7 +1636,7 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         }
     }
 
-    log::debug!("  -> SUCCESS");
+    log::trace!("  -> SUCCESS");
     Status::SUCCESS
 }
 
@@ -1683,7 +1683,7 @@ fn guid_eq(a: &Guid, b: &Guid) -> bool {
 fn log_guid(guid: &Guid) {
     let bytes = unsafe { core::slice::from_raw_parts(guid as *const Guid as *const u8, 16) };
     // Format as standard GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-    log::debug!(
+    log::trace!(
         "  GUID: {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         bytes[3], bytes[2], bytes[1], bytes[0],  // Data1 (LE)
         bytes[5], bytes[4],                       // Data2 (LE)

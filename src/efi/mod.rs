@@ -338,6 +338,28 @@ pub fn allocate_pages(num_pages: u64) -> Option<u64> {
     }
 }
 
+/// Allocate pages of memory below 4GB (for 32-bit DMA controllers like EHCI)
+///
+/// EHCI and other legacy controllers use 32-bit physical addresses for DMA.
+/// This function ensures the allocated memory is accessible by such controllers.
+///
+/// Returns the physical address of the allocated pages, or None if allocation failed.
+pub fn allocate_pages_below_4g(num_pages: u64) -> Option<u64> {
+    // Use AllocateMaxAddress with max address of 0xFFFFFFFF (4GB - 1)
+    let mut addr = 0xFFFF_FFFFu64;
+    let status = allocator::allocate_pages(
+        allocator::AllocateType::AllocateMaxAddress,
+        allocator::MemoryType::BootServicesData,
+        num_pages,
+        &mut addr,
+    );
+    if status == Status::SUCCESS {
+        Some(addr)
+    } else {
+        None
+    }
+}
+
 /// Free previously allocated pages (convenience function for drivers)
 pub fn free_pages(addr: u64, num_pages: u64) {
     let _ = allocator::free_pages(addr, num_pages);

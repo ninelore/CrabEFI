@@ -13,7 +13,7 @@ use crate::time::Timeout;
 use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
-use super::core::{
+use super::controller::{
     class, desc_type, parse_configuration, req_type, request, ConfigurationInfo, DeviceDescriptor,
     DeviceInfo, Direction, EndpointInfo, EndpointType, InterfaceInfo, UsbController, UsbError,
     UsbSpeed,

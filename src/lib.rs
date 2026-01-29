@@ -398,6 +398,76 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
             }
             log::error!("Failed to boot USB entry");
         }
+        menu::DeviceType::UsbGeneric {
+            controller_id,
+            device_addr: _,
+        } => {
+            use drivers::storage::{self, StorageType};
+
+            // USB device should already be stored globally from discovery
+            if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                // Get disk info for storage registration
+                let num_blocks = usb_device.num_blocks;
+                let block_size = usb_device.block_size;
+
+                // Register with storage abstraction (needed for BlockIO)
+                let storage_id = match storage::register_device(
+                    StorageType::Usb { slot_id: 0 },
+                    num_blocks,
+                    block_size,
+                ) {
+                    Some(id) => id,
+                    None => {
+                        log::error!("Failed to register USB device with storage");
+                        return;
+                    }
+                };
+
+                // Use with_controller to set up protocols (but NOT execute bootloader)
+                // This avoids deadlock since bootloader execution needs global_read_sector
+                // which also tries to acquire the controller lock
+                let setup_success = drivers::usb::with_controller(controller_id, |controller| {
+                    if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                        // Create disk for partition installation
+                        let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+
+                        // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
+                        let _ = install_block_io_for_disk(
+                            &mut disk,
+                            storage_id,
+                            block_size,
+                            num_blocks,
+                            entry.pci_device,
+                            entry.pci_function,
+                            0, // USB port
+                        );
+
+                        // Set up SimpleFileSystem protocol for the ESP
+                        if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
+                            let mut disk = fs::gpt::GenericUsbDisk::new(usb_device, controller);
+                            return setup_usb_esp_protocols(
+                                &mut disk,
+                                &entry.partition,
+                                entry.partition_num,
+                                entry.pci_device,
+                                entry.pci_function,
+                                0, // USB port (default)
+                            );
+                        }
+                    }
+                    false
+                });
+
+                // Now that controller lock is released, execute the bootloader
+                // The bootloader will use global_read_sector which can now acquire the lock
+                if setup_success == Some(true) {
+                    if execute_usb_bootloader() {
+                        return;
+                    }
+                }
+            }
+            log::error!("Failed to boot USB (generic) entry");
+        }
     }
 }
 
@@ -1236,14 +1306,14 @@ fn try_boot_from_esp<R: fs::gpt::SectorRead>(disk: &mut R, esp: &fs::gpt::Partit
 /// Try to boot from an ESP on USB (with SimpleFileSystem support)
 ///
 /// # Arguments
-/// * `disk` - USB disk to read from
+/// * `disk` - USB disk to read from (any SectorRead implementer)
 /// * `esp` - ESP partition info
 /// * `partition_num` - 1-based partition number of the ESP
-/// * `pci_device` - PCI device number of xHCI controller
+/// * `pci_device` - PCI device number of USB controller
 /// * `pci_function` - PCI function number
 /// * `usb_port` - USB port number
-fn try_boot_from_esp_usb(
-    disk: &mut fs::gpt::UsbDisk,
+fn try_boot_from_esp_usb<D: fs::gpt::SectorRead>(
+    disk: &mut D,
     esp: &fs::gpt::Partition,
     partition_num: u32,
     pci_device: u8,
@@ -1257,12 +1327,13 @@ fn try_boot_from_esp_usb(
     use efi::protocols::simple_file_system::{self, SIMPLE_FILE_SYSTEM_GUID};
     use r_efi::efi::Status;
 
+    // Extract filesystem state BEFORE creating FatFilesystem to avoid borrow conflict
+    // This reads the boot sector directly from disk
+    let fs_state = extract_fat_state(disk, esp.first_lba);
+
     match fs::fat::FatFilesystem::new(disk, esp.first_lba) {
         Ok(mut fat) => {
             log::info!("FAT filesystem mounted on ESP");
-
-            // Extract filesystem state for the SimpleFileSystem protocol
-            let fs_state = extract_fat_state(&fat, esp.first_lba);
 
             // Initialize SimpleFileSystem protocol
             let sfs_protocol =
@@ -1732,23 +1803,20 @@ fn try_boot_from_esp_ahci(
     false
 }
 
-/// Extract FAT filesystem state for the SimpleFileSystem protocol (USB version)
+/// Extract FAT filesystem state for the SimpleFileSystem protocol (generic version)
+///
+/// This version uses the provided disk directly instead of global_read_sector,
+/// which avoids deadlocks when called from within a with_controller closure.
 fn extract_fat_state<R: fs::gpt::SectorRead>(
-    _fat: &fs::fat::FatFilesystem<R>,
+    disk: &mut R,
     partition_start: u64,
 ) -> efi::protocols::simple_file_system::FilesystemState {
     use efi::protocols::simple_file_system::FilesystemState;
     use fs::fat::SECTOR_SIZE;
 
-    // We need to re-read the boot sector to extract the parameters
-    // This is a bit wasteful but keeps the FAT module clean
-
-    // For now, use defaults - we'll read from disk
-    // TODO: Add accessor methods to FatFilesystem to get these values
-
-    // Read boot sector directly using global read
+    // Read boot sector directly from the disk
     let mut buffer = [0u8; SECTOR_SIZE];
-    if let Err(_) = drivers::usb::mass_storage::global_read_sector(partition_start, &mut buffer) {
+    if let Err(_) = disk.read_sector(partition_start, &mut buffer) {
         log::error!("Failed to read boot sector for filesystem state");
         return FilesystemState::empty();
     }

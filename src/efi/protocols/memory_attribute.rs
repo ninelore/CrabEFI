@@ -86,7 +86,7 @@ extern "efiapi" fn get_memory_attributes(
         *attributes = 0;
     }
 
-    log::debug!("  -> SUCCESS (attributes=0x0)");
+    log::trace!("  -> SUCCESS (attributes=0x0)");
     Status::SUCCESS
 }
 
@@ -100,7 +100,7 @@ extern "efiapi" fn set_memory_attributes(
     length: u64,
     attributes: u64,
 ) -> Status {
-    log::debug!(
+    log::trace!(
         "MemAttr.SetMemoryAttributes(base={:#x}, len={:#x}, attr={:#x})",
         base_address,
         length,
@@ -108,18 +108,18 @@ extern "efiapi" fn set_memory_attributes(
     );
 
     if length == 0 {
-        log::debug!("  -> INVALID_PARAMETER (length is 0)");
+        log::trace!("  -> INVALID_PARAMETER (length is 0)");
         return Status::INVALID_PARAMETER;
     }
 
     if attributes == 0 {
-        log::debug!("  -> INVALID_PARAMETER (attributes is 0)");
+        log::trace!("  -> INVALID_PARAMETER (attributes is 0)");
         return Status::INVALID_PARAMETER;
     }
 
     // Validate that only valid attribute bits are set
     if (attributes & !EFI_MEMORY_ACCESS_MASK) != 0 {
-        log::debug!("  -> INVALID_PARAMETER (invalid attribute bits)");
+        log::trace!("  -> INVALID_PARAMETER (invalid attribute bits)");
         return Status::INVALID_PARAMETER;
     }
 
@@ -134,7 +134,7 @@ extern "efiapi" fn set_memory_attributes(
     if attributes & EFI_MEMORY_RO != 0 {
         let _ = attr_str.push_str("RO ");
     }
-    log::debug!("  -> SUCCESS (stubbed, requested: {})", attr_str.as_str());
+    log::trace!("  -> SUCCESS (stubbed, requested: {})", attr_str.as_str());
 
     // In a full implementation, we would modify page table entries here
     // to set the appropriate protection bits (NX, read-only, etc.)
@@ -153,7 +153,7 @@ extern "efiapi" fn clear_memory_attributes(
     length: u64,
     attributes: u64,
 ) -> Status {
-    log::debug!(
+    log::trace!(
         "MemAttr.ClearMemoryAttributes(base={:#x}, len={:#x}, attr={:#x})",
         base_address,
         length,
@@ -161,13 +161,13 @@ extern "efiapi" fn clear_memory_attributes(
     );
 
     if length == 0 {
-        log::debug!("  -> INVALID_PARAMETER (length is 0)");
+        log::trace!("  -> INVALID_PARAMETER (length is 0)");
         return Status::INVALID_PARAMETER;
     }
 
     // Validate that only valid attribute bits are set
     if (attributes & !EFI_MEMORY_ACCESS_MASK) != 0 {
-        log::debug!("  -> INVALID_PARAMETER (invalid attribute bits)");
+        log::trace!("  -> INVALID_PARAMETER (invalid attribute bits)");
         return Status::INVALID_PARAMETER;
     }
 
@@ -182,7 +182,7 @@ extern "efiapi" fn clear_memory_attributes(
     if attributes & EFI_MEMORY_RO != 0 {
         let _ = attr_str.push_str("RO ");
     }
-    log::debug!("  -> SUCCESS (stubbed, clearing: {})", attr_str.as_str());
+    log::trace!("  -> SUCCESS (stubbed, clearing: {})", attr_str.as_str());
 
     Status::SUCCESS
 }
