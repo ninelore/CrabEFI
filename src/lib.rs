@@ -1628,9 +1628,9 @@ fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
-    use efi::allocator::{allocate_pool, free_pool, MemoryType};
+    use efi::allocator::{MemoryType, allocate_pool, free_pool};
     use efi::boot_services;
-    use efi::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
     use r_efi::efi::Status;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);

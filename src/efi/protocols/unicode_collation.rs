@@ -4,7 +4,7 @@
 //! string comparison and FAT filename handling services.
 
 use core::ffi::c_void;
-use r_efi::efi::{Boolean, Char16, Char8, Guid};
+use r_efi::efi::{Boolean, Char8, Char16, Guid};
 
 /// Unicode Collation Protocol GUID (version 2)
 pub const UNICODE_COLLATION_PROTOCOL2_GUID: Guid = Guid::from_fields(
@@ -161,7 +161,7 @@ extern "efiapi" fn metai_match(
                         Boolean::TRUE
                     } else {
                         Boolean::FALSE
-                    }
+                    };
                 }
                 0x2A => {
                     // '*' - match zero or more characters

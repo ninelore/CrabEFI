@@ -8,9 +8,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use log::{Level, LevelFilter, Metadata, Record};
 use spin::Mutex;
 
-use crate::coreboot::cbmem_console;
 use crate::coreboot::FramebufferInfo;
-use crate::framebuffer_console::{Color, CHAR_HEIGHT, CHAR_WIDTH};
+use crate::coreboot::cbmem_console;
+use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, Color};
 
 /// Global framebuffer console for logging
 /// We store the FramebufferInfo directly and create a console on demand

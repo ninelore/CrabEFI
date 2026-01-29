@@ -8,7 +8,7 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{hid_request, req_type, UsbController, UsbError};
+use super::controller::{UsbController, UsbError, hid_request, req_type};
 use spin::Mutex;
 
 // ============================================================================
@@ -727,4 +727,9 @@ pub fn poll<C: UsbController>(controller: &mut C) {
 /// Check if USB keyboard is available
 pub fn is_available() -> bool {
     USB_KEYBOARD.lock().is_some()
+}
+
+/// Get the controller index that has the keyboard
+pub fn controller_idx() -> Option<usize> {
+    USB_KEYBOARD.lock().as_ref().map(|k| k.controller_idx())
 }

@@ -9,12 +9,12 @@
 //! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
-use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
+use super::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
 use super::system_table;
 use crate::pe;
 use crate::state::{
-    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
-    MAX_PROTOCOLS_PER_HANDLE,
+    self, EventEntry, LoadedImageEntry, MAX_EVENTS, MAX_HANDLES, MAX_PROTOCOLS_PER_HANDLE,
+    ProtocolEntry,
 };
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
@@ -1560,11 +1560,22 @@ fn log_guid(guid: &Guid) {
     // Format as standard GUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
     log::trace!(
         "  GUID: {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[3], bytes[2], bytes[1], bytes[0],  // Data1 (LE)
-        bytes[5], bytes[4],                       // Data2 (LE)
-        bytes[7], bytes[6],                       // Data3 (LE)
-        bytes[8], bytes[9],                       // Data4[0-1]
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]  // Data4[2-7]
+        bytes[3],
+        bytes[2],
+        bytes[1],
+        bytes[0], // Data1 (LE)
+        bytes[5],
+        bytes[4], // Data2 (LE)
+        bytes[7],
+        bytes[6], // Data3 (LE)
+        bytes[8],
+        bytes[9], // Data4[0-1]
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15] // Data4[2-7]
     );
 }
 

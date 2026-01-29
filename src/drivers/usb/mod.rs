@@ -322,14 +322,16 @@ pub fn find_mass_storage() -> Option<(usize, u8)> {
 
 /// Poll USB keyboards
 pub fn poll_keyboards() {
+    // Get which controller has the keyboard
+    let keyboard_ctrl_idx = match hid_keyboard::controller_idx() {
+        Some(idx) => idx,
+        None => return, // No keyboard initialized
+    };
+
     let controllers = ALL_CONTROLLERS.lock();
 
-    for (_idx, handle) in controllers.iter().enumerate() {
-        // Only poll the controller that has the keyboard
-        if !hid_keyboard::is_available() {
-            continue;
-        }
-
+    // Only poll the specific controller that has the keyboard
+    if let Some(handle) = controllers.get(keyboard_ctrl_idx) {
         with_usb_controller!(handle, mut |controller| {
             hid_keyboard::poll(controller);
         });

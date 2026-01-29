@@ -1674,35 +1674,35 @@ impl EhciController {
         let qtd_buffer0 =
             unsafe { ptr::read_volatile(&(*(qtd_setup_addr as *const Qtd)).buffer[0]) };
 
-        log::debug!(
+        log::trace!(
             "EHCI: QH@{:#x} async_head@{:#x} async_head.link={:#x}",
             qh_addr,
             self.async_qh,
             async_link
         );
-        log::debug!(
+        log::trace!(
             "EHCI: QH.ep_chars={:#x} current_qtd={:#x} overlay.next={:#x} overlay.token={:#x}",
             qh_ep_chars,
             qh_current,
             qh_overlay_next,
             qh_overlay_token
         );
-        log::debug!(
+        log::trace!(
             "EHCI: setup_qtd@{:#x} buffer[0]={:#x}",
             qtd_setup_addr,
             qtd_buffer0
         );
-        log::debug!(
+        log::trace!(
             "EHCI: ASYNCLISTADDR={:#x}, USBCMD={:#x}",
             self.read_op(0x18),
             self.read_op(0x00)
         );
-        log::debug!(
+        log::trace!(
             "EHCI: QH.ep_chars={:#x}, QH.overlay.next_qtd={:#x}",
             qh_ep_chars,
             qh_overlay_next
         );
-        log::debug!(
+        log::trace!(
             "EHCI: ASYNCLISTADDR={:#x}, USBCMD={:#x}",
             self.read_op(0x18),
             self.read_op(0x00)

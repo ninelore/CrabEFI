@@ -354,6 +354,9 @@ pub fn init() {
 
 /// Check if keyboard data is available (PS/2 or USB)
 pub fn has_key() -> bool {
+    // Poll USB keyboard to get latest key state
+    crate::drivers::usb::poll_keyboards();
+
     // Check USB keyboard first
     if crate::drivers::usb::keyboard_has_key() {
         return true;
@@ -427,6 +430,9 @@ pub fn cleanup() {
 /// - For printable characters: scan_code = 0, unicode_char = ASCII code
 /// - For special keys: scan_code = EFI scan code, unicode_char = 0
 pub fn try_read_key() -> Option<(u16, u16)> {
+    // Poll USB keyboard to get latest key state
+    crate::drivers::usb::poll_keyboards();
+
     // Try USB keyboard first
     if let Some(key) = crate::drivers::usb::keyboard_get_key() {
         return Some(key);
