@@ -14,9 +14,8 @@ use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
 use super::controller::{
-    class, desc_type, parse_configuration, req_type, request, ConfigurationInfo, DeviceDescriptor,
-    DeviceInfo, Direction, EndpointInfo, EndpointType, InterfaceInfo, UsbController, UsbError,
-    UsbSpeed,
+    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, Direction,
+    EndpointInfo, UsbController, UsbDevice, UsbError, UsbSpeed,
 };
 
 // ============================================================================
@@ -359,59 +358,7 @@ impl TransferDescriptor {
     }
 }
 
-// ============================================================================
-// USB Device State
-// ============================================================================
-
-/// OHCI USB device state
-pub struct OhciDevice {
-    /// Device address (1-127)
-    pub address: u8,
-    /// Port number (0-based)
-    pub port: u8,
-    /// Device speed
-    pub speed: UsbSpeed,
-    /// Device descriptor
-    pub device_desc: DeviceDescriptor,
-    /// Configuration info
-    pub config_info: ConfigurationInfo,
-    /// Is mass storage device
-    pub is_mass_storage: bool,
-    /// Is HID keyboard
-    pub is_hid_keyboard: bool,
-    /// Bulk IN endpoint
-    pub bulk_in: Option<EndpointInfo>,
-    /// Bulk OUT endpoint
-    pub bulk_out: Option<EndpointInfo>,
-    /// Interrupt IN endpoint
-    pub interrupt_in: Option<EndpointInfo>,
-    /// Control endpoint max packet size
-    pub ep0_max_packet: u16,
-    /// Data toggle for bulk IN
-    pub bulk_in_toggle: bool,
-    /// Data toggle for bulk OUT
-    pub bulk_out_toggle: bool,
-}
-
-impl OhciDevice {
-    fn new(address: u8, port: u8, speed: UsbSpeed) -> Self {
-        Self {
-            address,
-            port,
-            speed,
-            device_desc: DeviceDescriptor::default(),
-            config_info: ConfigurationInfo::default(),
-            is_mass_storage: false,
-            is_hid_keyboard: false,
-            bulk_in: None,
-            bulk_out: None,
-            interrupt_in: None,
-            ep0_max_packet: 8,
-            bulk_in_toggle: false,
-            bulk_out_toggle: false,
-        }
-    }
-}
+// UsbDevice is now UsbDevice from controller.rs
 
 // ============================================================================
 // OHCI Controller
@@ -432,7 +379,7 @@ pub struct OhciController {
     /// Number of ports
     num_ports: u8,
     /// Devices
-    devices: [Option<OhciDevice>; MAX_DEVICES],
+    devices: [Option<UsbDevice>; MAX_DEVICES],
     /// Next device address
     next_address: u8,
     /// HCCA
@@ -688,7 +635,7 @@ impl OhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        let mut device = OhciDevice::new(0, port, speed);
+        let mut device = UsbDevice::new(0, port, speed);
 
         // Get initial device descriptor (8 bytes)
         let mut desc_buf = [0u8; 8];
@@ -796,7 +743,7 @@ impl OhciController {
     /// Internal control transfer
     fn control_transfer_internal(
         &mut self,
-        device: &OhciDevice,
+        device: &UsbDevice,
         request_type: u8,
         request: u8,
         value: u16,
@@ -944,13 +891,13 @@ impl OhciController {
         Ok(data_len)
     }
 
-    fn get_device_mut(&mut self, address: u8) -> Option<&mut OhciDevice> {
+    fn get_device_mut(&mut self, address: u8) -> Option<&mut UsbDevice> {
         self.devices
             .iter_mut()
             .find_map(|d| d.as_mut().filter(|d| d.address == address))
     }
 
-    fn get_device(&self, address: u8) -> Option<&OhciDevice> {
+    fn get_device(&self, address: u8) -> Option<&UsbDevice> {
         self.devices
             .iter()
             .find_map(|d| d.as_ref().filter(|d| d.address == address))
@@ -977,7 +924,7 @@ impl UsbController for OhciController {
         data: Option<&mut [u8]>,
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-        let dev_copy = OhciDevice {
+        let dev_copy = UsbDevice {
             address: dev.address,
             port: dev.port,
             speed: dev.speed,

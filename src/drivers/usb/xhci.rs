@@ -10,6 +10,8 @@ use core::sync::atomic::{fence, Ordering};
 
 use spin::Mutex;
 
+use super::controller::{desc_type, parse_configuration, req_type, request, DeviceDescriptor};
+
 /// xHCI Capability Registers
 mod cap_regs {
     /// Capability Register Length
@@ -194,101 +196,9 @@ mod trb_cc {
     pub const SHORT_PACKET: u32 = 13;
 }
 
-/// USB Request Types
-mod usb_req_type {
-    pub const DIR_OUT: u8 = 0x00;
-    pub const DIR_IN: u8 = 0x80;
-    pub const TYPE_STANDARD: u8 = 0x00;
-    pub const TYPE_CLASS: u8 = 0x20;
-    pub const TYPE_VENDOR: u8 = 0x40;
-    pub const RCPT_DEVICE: u8 = 0x00;
-    pub const RCPT_INTERFACE: u8 = 0x01;
-    pub const RCPT_ENDPOINT: u8 = 0x02;
-}
-
-/// USB Standard Requests
-mod usb_req {
-    pub const GET_STATUS: u8 = 0x00;
-    pub const CLEAR_FEATURE: u8 = 0x01;
-    pub const SET_FEATURE: u8 = 0x03;
-    pub const SET_ADDRESS: u8 = 0x05;
-    pub const GET_DESCRIPTOR: u8 = 0x06;
-    pub const SET_DESCRIPTOR: u8 = 0x07;
-    pub const GET_CONFIGURATION: u8 = 0x08;
-    pub const SET_CONFIGURATION: u8 = 0x09;
-    pub const GET_INTERFACE: u8 = 0x0A;
-    pub const SET_INTERFACE: u8 = 0x0B;
-}
-
-/// USB Descriptor Types
-mod usb_desc_type {
-    pub const DEVICE: u8 = 1;
-    pub const CONFIGURATION: u8 = 2;
-    pub const STRING: u8 = 3;
-    pub const INTERFACE: u8 = 4;
-    pub const ENDPOINT: u8 = 5;
-}
-
-/// USB Device Descriptor
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct UsbDeviceDescriptor {
-    pub length: u8,
-    pub descriptor_type: u8,
-    pub bcd_usb: u16,
-    pub device_class: u8,
-    pub device_subclass: u8,
-    pub device_protocol: u8,
-    pub max_packet_size0: u8,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub bcd_device: u16,
-    pub manufacturer: u8,
-    pub product: u8,
-    pub serial_number: u8,
-    pub num_configurations: u8,
-}
-
-/// USB Configuration Descriptor
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct UsbConfigDescriptor {
-    pub length: u8,
-    pub descriptor_type: u8,
-    pub total_length: u16,
-    pub num_interfaces: u8,
-    pub configuration_value: u8,
-    pub configuration: u8,
-    pub attributes: u8,
-    pub max_power: u8,
-}
-
-/// USB Interface Descriptor
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct UsbInterfaceDescriptor {
-    pub length: u8,
-    pub descriptor_type: u8,
-    pub interface_number: u8,
-    pub alternate_setting: u8,
-    pub num_endpoints: u8,
-    pub interface_class: u8,
-    pub interface_subclass: u8,
-    pub interface_protocol: u8,
-    pub interface: u8,
-}
-
-/// USB Endpoint Descriptor
-#[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
-pub struct UsbEndpointDescriptor {
-    pub length: u8,
-    pub descriptor_type: u8,
-    pub endpoint_address: u8,
-    pub attributes: u8,
-    pub max_packet_size: u16,
-    pub interval: u8,
-}
+// NOTE: USB descriptor types (DeviceDescriptor, ConfigurationDescriptor, etc.)
+// and USB constants (req_type, request, desc_type) are imported from
+// super::controller to avoid duplication with EHCI/OHCI/UHCI drivers.
 
 /// Transfer Request Block (16 bytes)
 #[repr(C, align(16))]
@@ -574,7 +484,7 @@ pub struct UsbSlot {
     /// Transfer rings for each endpoint (0 = control, 1-30 = other)
     pub transfer_rings: [Option<TrbRing>; 31],
     /// Device descriptor
-    pub device_desc: UsbDeviceDescriptor,
+    pub device_desc: DeviceDescriptor,
     /// Port number
     pub port: u8,
     /// Speed
@@ -1114,7 +1024,7 @@ impl XhciController {
             device_context: device_context as *mut DeviceContext,
             input_context: input_context as *mut InputContext,
             transfer_rings,
-            device_desc: UsbDeviceDescriptor::default(),
+            device_desc: DeviceDescriptor::default(),
             port,
             speed,
             is_mass_storage: false,
@@ -1202,16 +1112,16 @@ impl XhciController {
     }
 
     /// Get device descriptor
-    fn get_device_descriptor(&mut self, slot_id: u8) -> Result<UsbDeviceDescriptor, XhciError> {
+    fn get_device_descriptor(&mut self, slot_id: u8) -> Result<DeviceDescriptor, XhciError> {
         let mut desc = [0u8; 18];
 
         // First, get just 8 bytes to determine max packet size
         let mut short_desc = [0u8; 8];
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::DEVICE as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::DEVICE as u16) << 8,
             0,
             Some(&mut short_desc),
         )?;
@@ -1219,22 +1129,22 @@ impl XhciController {
         // Now get full descriptor
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::DEVICE as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::DEVICE as u16) << 8,
             0,
             Some(&mut desc),
         )?;
 
-        Ok(unsafe { ptr::read_unaligned(desc.as_ptr() as *const UsbDeviceDescriptor) })
+        Ok(unsafe { ptr::read_unaligned(desc.as_ptr() as *const DeviceDescriptor) })
     }
 
     /// Set configuration
     fn set_configuration(&mut self, slot_id: u8, config: u8) -> Result<(), XhciError> {
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_OUT | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::SET_CONFIGURATION,
+            req_type::DIR_OUT | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::SET_CONFIGURATION,
             config as u16,
             0,
             None,
@@ -1338,6 +1248,8 @@ impl XhciController {
     }
 
     /// Configure a mass storage device
+    ///
+    /// Uses the shared parse_configuration() infrastructure from controller.rs
     fn configure_mass_storage(&mut self, slot_id: u8) -> Result<(), XhciError> {
         // Get configuration descriptor
         let mut config_buf = [0u8; 256];
@@ -1346,9 +1258,9 @@ impl XhciController {
         let mut header = [0u8; 9];
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::CONFIGURATION as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
             0,
             Some(&mut header),
         )?;
@@ -1359,80 +1271,57 @@ impl XhciController {
         // Get full configuration
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::CONFIGURATION as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
             0,
             Some(&mut config_buf[..total_len]),
         )?;
 
-        // Parse configuration to find mass storage interface
-        let mut offset = 9; // Skip config descriptor
+        // Parse configuration using shared infrastructure
+        let config_info = parse_configuration(&config_buf[..total_len]);
+
+        // Find mass storage interface
         let mut bulk_in = 0u8;
         let mut bulk_out = 0u8;
         let mut bulk_max_packet = 0u16;
-        let mut is_mass_storage = false;
-        let mut _interface_num = 0u8;
+        let mut found = false;
 
-        while offset < total_len {
-            let len = config_buf[offset] as usize;
-            if len == 0 {
+        for iface in &config_info.interfaces[..config_info.num_interfaces] {
+            if iface.is_mass_storage() {
+                log::info!(
+                    "  Found USB Mass Storage interface {}",
+                    iface.interface_number
+                );
+
+                if let Some(ep) = iface.find_bulk_in() {
+                    bulk_in = ep.number;
+                    bulk_max_packet = ep.max_packet_size;
+                    log::debug!(
+                        "    Bulk IN EP: {} max_packet: {}",
+                        bulk_in,
+                        bulk_max_packet
+                    );
+                }
+                if let Some(ep) = iface.find_bulk_out() {
+                    bulk_out = ep.number;
+                    log::debug!(
+                        "    Bulk OUT EP: {} max_packet: {}",
+                        bulk_out,
+                        ep.max_packet_size
+                    );
+                }
+                found = true;
                 break;
             }
-
-            let desc_type = config_buf[offset + 1];
-
-            if desc_type == usb_desc_type::INTERFACE && offset + 9 <= total_len {
-                let iface = unsafe {
-                    ptr::read_unaligned(
-                        config_buf[offset..].as_ptr() as *const UsbInterfaceDescriptor
-                    )
-                };
-
-                // Mass storage class = 0x08, SCSI = 0x06, Bulk-Only = 0x50
-                if iface.interface_class == 0x08 && iface.interface_protocol == 0x50 {
-                    is_mass_storage = true;
-                    _interface_num = iface.interface_number;
-                    log::info!("  Found USB Mass Storage interface {}", _interface_num);
-                }
-            } else if desc_type == usb_desc_type::ENDPOINT
-                && offset + 7 <= total_len
-                && is_mass_storage
-            {
-                let ep = unsafe {
-                    ptr::read_unaligned(
-                        config_buf[offset..].as_ptr() as *const UsbEndpointDescriptor
-                    )
-                };
-
-                // Bulk endpoint (type 2)
-                if (ep.attributes & 0x03) == 0x02 {
-                    let ep_addr = ep.endpoint_address;
-                    let max_packet = ep.max_packet_size;
-
-                    if ep_addr & 0x80 != 0 {
-                        // IN endpoint
-                        bulk_in = ep_addr & 0x0F;
-                        bulk_max_packet = max_packet;
-                        log::debug!("    Bulk IN EP: {} max_packet: {}", bulk_in, max_packet);
-                    } else {
-                        // OUT endpoint
-                        bulk_out = ep_addr & 0x0F;
-                        log::debug!("    Bulk OUT EP: {} max_packet: {}", bulk_out, max_packet);
-                    }
-                }
-            }
-
-            offset += len;
         }
 
-        if !is_mass_storage || bulk_in == 0 || bulk_out == 0 {
+        if !found || bulk_in == 0 || bulk_out == 0 {
             return Err(XhciError::DeviceNotFound);
         }
 
         // Set configuration
-        let config_value = config_buf[5]; // bConfigurationValue
-        self.set_configuration(slot_id, config_value)?;
+        self.set_configuration(slot_id, config_info.configuration_value)?;
 
         // Configure endpoints
         self.configure_bulk_endpoints(slot_id, bulk_in, bulk_out, bulk_max_packet)?;
@@ -1450,6 +1339,8 @@ impl XhciController {
     }
 
     /// Configure a HID keyboard device
+    ///
+    /// Uses the shared parse_configuration() infrastructure from controller.rs
     fn configure_hid_keyboard(&mut self, slot_id: u8) -> Result<(), XhciError> {
         // Get configuration descriptor
         let mut config_buf = [0u8; 256];
@@ -1458,9 +1349,9 @@ impl XhciController {
         let mut header = [0u8; 9];
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::CONFIGURATION as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
             0,
             Some(&mut header),
         )?;
@@ -1471,86 +1362,51 @@ impl XhciController {
         // Get full configuration
         self.control_transfer(
             slot_id,
-            usb_req_type::DIR_IN | usb_req_type::TYPE_STANDARD | usb_req_type::RCPT_DEVICE,
-            usb_req::GET_DESCRIPTOR,
-            (usb_desc_type::CONFIGURATION as u16) << 8,
+            req_type::DIR_IN | req_type::TYPE_STANDARD | req_type::RCPT_DEVICE,
+            request::GET_DESCRIPTOR,
+            (desc_type::CONFIGURATION as u16) << 8,
             0,
             Some(&mut config_buf[..total_len]),
         )?;
 
-        // Parse configuration to find HID keyboard interface
-        let mut offset = 9; // Skip config descriptor
+        // Parse configuration using shared infrastructure
+        let config_info = parse_configuration(&config_buf[..total_len]);
+
+        // Find HID keyboard interface
         let mut interrupt_in = 0u8;
         let mut interrupt_max_packet = 0u16;
         let mut interrupt_interval = 0u8;
-        let mut is_hid_keyboard = false;
-        let mut _interface_num = 0u8;
+        let mut found = false;
 
-        while offset < total_len {
-            let len = config_buf[offset] as usize;
-            if len == 0 {
+        for iface in &config_info.interfaces[..config_info.num_interfaces] {
+            if iface.is_hid_keyboard() {
+                log::info!(
+                    "  Found USB HID Keyboard interface {}",
+                    iface.interface_number
+                );
+
+                if let Some(ep) = iface.find_interrupt_in() {
+                    interrupt_in = ep.number;
+                    interrupt_max_packet = ep.max_packet_size;
+                    interrupt_interval = ep.interval;
+                    log::debug!(
+                        "    Interrupt IN EP: {} max_packet: {} interval: {}",
+                        interrupt_in,
+                        interrupt_max_packet,
+                        interrupt_interval
+                    );
+                }
+                found = true;
                 break;
             }
-
-            let desc_type = config_buf[offset + 1];
-
-            if desc_type == usb_desc_type::INTERFACE && offset + 9 <= total_len {
-                let iface = unsafe {
-                    ptr::read_unaligned(
-                        config_buf[offset..].as_ptr() as *const UsbInterfaceDescriptor
-                    )
-                };
-
-                // HID class = 0x03, boot subclass = 0x01, keyboard protocol = 0x01
-                if iface.interface_class == 0x03
-                    && iface.interface_subclass == 0x01
-                    && iface.interface_protocol == 0x01
-                {
-                    is_hid_keyboard = true;
-                    _interface_num = iface.interface_number;
-                    log::info!("  Found USB HID Keyboard interface {}", _interface_num);
-                }
-            } else if desc_type == usb_desc_type::ENDPOINT
-                && offset + 7 <= total_len
-                && is_hid_keyboard
-            {
-                let ep = unsafe {
-                    ptr::read_unaligned(
-                        config_buf[offset..].as_ptr() as *const UsbEndpointDescriptor
-                    )
-                };
-
-                // Interrupt endpoint (type 3)
-                if (ep.attributes & 0x03) == 0x03 {
-                    let ep_addr = ep.endpoint_address;
-                    let max_packet = ep.max_packet_size;
-                    let interval = ep.interval;
-
-                    if ep_addr & 0x80 != 0 {
-                        // IN endpoint
-                        interrupt_in = ep_addr & 0x0F;
-                        interrupt_max_packet = max_packet;
-                        interrupt_interval = interval;
-                        log::debug!(
-                            "    Interrupt IN EP: {} max_packet: {} interval: {}",
-                            interrupt_in,
-                            max_packet,
-                            interval
-                        );
-                    }
-                }
-            }
-
-            offset += len;
         }
 
-        if !is_hid_keyboard || interrupt_in == 0 {
+        if !found || interrupt_in == 0 {
             return Err(XhciError::DeviceNotFound);
         }
 
         // Set configuration
-        let config_value = config_buf[5]; // bConfigurationValue
-        self.set_configuration(slot_id, config_value)?;
+        self.set_configuration(slot_id, config_info.configuration_value)?;
 
         // Update slot info (but don't configure endpoint - we use control transfers for HID)
         if let Some(slot) = &mut self.slots[slot_id as usize] {

@@ -404,16 +404,7 @@ impl UsbMassStorage {
         }
     }
 
-    /// Read sectors from the device (xHCI-specific, for backwards compatibility)
-    pub fn read_sectors(
-        &mut self,
-        controller: &mut XhciController,
-        start_lba: u64,
-        num_sectors: u32,
-        buffer: &mut [u8],
-    ) -> Result<(), MassStorageError> {
-        self.read_sectors_generic(controller, start_lba, num_sectors, buffer)
-    }
+    // Note: read_sectors() was removed - use read_sectors_generic() instead
 
     /// READ(10) command
     fn read_10(
@@ -559,57 +550,40 @@ pub fn get_global_device() -> Option<&'static mut UsbMassStorage> {
 ///
 /// This function can be used as the read callback for the SimpleFileSystem protocol.
 pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
-    log::trace!("global_read_sector: LBA={}", lba);
+    log::trace!("USB mass storage: read LBA {}", lba);
 
-    // Get the device - use a scope to release lock immediately
+    // Get the device pointer (release lock immediately to avoid deadlock)
     let device_ptr = {
         let guard = GLOBAL_USB_DEVICE.lock();
         match guard.as_ref() {
             Some(ptr) => ptr.0,
             None => {
-                log::error!("global_read_sector: no device stored");
+                log::error!("USB mass storage: no device configured");
                 return Err(());
             }
         }
     };
     let device = unsafe { &mut *device_ptr };
 
-    // Get the controller ID
-    let controller_id = *GLOBAL_CONTROLLER_ID.lock();
-    log::debug!("global_read_sector: controller_id={:?}", controller_id);
+    // Get the controller ID (defaults to 0 if not set)
+    let controller_id = GLOBAL_CONTROLLER_ID.lock().unwrap_or(0);
 
-    match controller_id {
-        // Legacy path: use xHCI controller 0
+    // Use the xHCI-specific controller path to match how the device was initialized
+    // (the device is created via xhci::get_controller in try_boot_from_usb)
+    let controller = match super::xhci::get_controller(controller_id) {
+        Some(c) => c,
         None => {
-            let controller = match super::get_controller(0) {
-                Some(c) => c,
-                None => {
-                    log::error!("global_read_sector: no xHCI controller");
-                    return Err(());
-                }
-            };
-            device
-                .read_sectors(controller, lba, 1, buffer)
-                .map_err(|e| {
-                    log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
-                })
+            log::error!(
+                "USB mass storage: xHCI controller {} not found",
+                controller_id
+            );
+            return Err(());
         }
-        // Generic path: use controller by ID
-        Some(id) => {
-            log::debug!("global_read_sector: using generic path, controller {}", id);
-            let result = super::with_controller(id, |controller| {
-                log::debug!("global_read_sector: got controller, calling read_sectors_generic");
-                device
-                    .read_sectors_generic(controller, lba, 1, buffer)
-                    .map_err(|e| {
-                        log::error!("global_read_sector: read failed at LBA {}: {:?}", lba, e);
-                    })
-            });
-            log::debug!("global_read_sector: with_controller returned");
-            result.unwrap_or_else(|| {
-                log::error!("global_read_sector: controller {} not found", id);
-                Err(())
-            })
-        }
-    }
+    };
+
+    device
+        .read_sectors_generic(controller, lba, 1, buffer)
+        .map_err(|e| {
+            log::error!("USB mass storage: read failed at LBA {}: {:?}", lba, e);
+        })
 }

@@ -432,7 +432,7 @@ impl<'a> SectorRead for UsbDisk<'a> {
         }
 
         self.device
-            .read_sectors(self.controller, lba, 1, buffer)
+            .read_sectors_generic(self.controller, lba, 1, buffer)
             .map_err(|e| {
                 log::debug!("USB read_sector failed at LBA {}: {:?}", lba, e);
                 GptError::ReadError

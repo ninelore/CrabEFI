@@ -4,7 +4,7 @@
 //! and log diagnostic information.
 
 use core::arch::{asm, naked_asm};
-use core::ptr::{addr_of, addr_of_mut};
+use core::ptr::addr_of_mut;
 
 /// IDT entry (interrupt gate descriptor)
 #[repr(C, packed)]

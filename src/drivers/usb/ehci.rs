@@ -25,8 +25,8 @@ use core::ptr;
 use core::sync::atomic::{fence, Ordering};
 
 use super::controller::{
-    desc_type, parse_configuration, req_type, request, ConfigurationInfo, DeviceDescriptor,
-    DeviceInfo, EndpointInfo, UsbController, UsbError, UsbSpeed,
+    desc_type, parse_configuration, req_type, request, DeviceDescriptor, DeviceInfo, EndpointInfo,
+    UsbController, UsbDevice, UsbError, UsbSpeed,
 };
 
 // ============================================================================
@@ -517,59 +517,7 @@ impl Qh {
     }
 }
 
-// ============================================================================
-// EHCI Device State
-// ============================================================================
-
-/// EHCI USB device state
-pub struct EhciDevice {
-    /// Device address (1-127)
-    pub address: u8,
-    /// Port number (0-based)
-    pub port: u8,
-    /// Device speed
-    pub speed: UsbSpeed,
-    /// Device descriptor
-    pub device_desc: DeviceDescriptor,
-    /// Configuration info
-    pub config_info: ConfigurationInfo,
-    /// Is mass storage device
-    pub is_mass_storage: bool,
-    /// Is HID keyboard
-    pub is_hid_keyboard: bool,
-    /// Bulk IN endpoint
-    pub bulk_in: Option<EndpointInfo>,
-    /// Bulk OUT endpoint
-    pub bulk_out: Option<EndpointInfo>,
-    /// Interrupt IN endpoint
-    pub interrupt_in: Option<EndpointInfo>,
-    /// Control endpoint max packet size
-    pub ep0_max_packet: u16,
-    /// Data toggle for bulk IN
-    pub bulk_in_toggle: bool,
-    /// Data toggle for bulk OUT
-    pub bulk_out_toggle: bool,
-}
-
-impl EhciDevice {
-    fn new(address: u8, port: u8, speed: UsbSpeed) -> Self {
-        Self {
-            address,
-            port,
-            speed,
-            device_desc: DeviceDescriptor::default(),
-            config_info: ConfigurationInfo::default(),
-            is_mass_storage: false,
-            is_hid_keyboard: false,
-            bulk_in: None,
-            bulk_out: None,
-            interrupt_in: None,
-            ep0_max_packet: if speed == UsbSpeed::High { 64 } else { 8 },
-            bulk_in_toggle: false,
-            bulk_out_toggle: false,
-        }
-    }
-}
+// UsbDevice is now UsbDevice from controller.rs
 
 // ============================================================================
 // EHCI Controller
@@ -596,7 +544,7 @@ pub struct EhciController {
     /// 64-bit addressing supported
     has_64bit: bool,
     /// Devices
-    devices: [Option<EhciDevice>; MAX_DEVICES],
+    devices: [Option<UsbDevice>; MAX_DEVICES],
     /// Next device address
     next_address: u8,
     /// Async schedule list head QH
@@ -974,7 +922,7 @@ impl EhciController {
             .position(|d| d.is_none())
             .ok_or(UsbError::NoFreeSlots)?;
 
-        let mut device = EhciDevice::new(0, port, speed);
+        let mut device = UsbDevice::new(0, port, speed);
 
         // Get initial device descriptor (first 8 bytes)
         let mut desc_buf = [0u8; 8];
@@ -1081,7 +1029,7 @@ impl EhciController {
     /// Perform a control transfer
     fn control_transfer_internal(
         &mut self,
-        device: &EhciDevice,
+        device: &UsbDevice,
         request_type: u8,
         request: u8,
         value: u16,
@@ -1504,7 +1452,7 @@ impl EhciController {
     /// Perform a bulk transfer
     fn bulk_transfer_internal(
         &mut self,
-        device: &EhciDevice,
+        device: &UsbDevice,
         endpoint: u8,
         is_in: bool,
         data: &mut [u8],
@@ -1638,13 +1586,13 @@ impl EhciController {
         Ok((transferred, new_toggle))
     }
 
-    fn get_device_mut(&mut self, address: u8) -> Option<&mut EhciDevice> {
+    fn get_device_mut(&mut self, address: u8) -> Option<&mut UsbDevice> {
         self.devices
             .iter_mut()
             .find_map(|d| d.as_mut().filter(|d| d.address == address))
     }
 
-    fn get_device(&self, address: u8) -> Option<&EhciDevice> {
+    fn get_device(&self, address: u8) -> Option<&UsbDevice> {
         self.devices
             .iter()
             .find_map(|d| d.as_ref().filter(|d| d.address == address))
@@ -1710,7 +1658,7 @@ impl UsbController for EhciController {
     ) -> Result<usize, UsbError> {
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
         // Clone the relevant fields to avoid borrow issues
-        let dev_copy = EhciDevice {
+        let dev_copy = UsbDevice {
             address: dev.address,
             port: dev.port,
             speed: dev.speed,
@@ -1743,7 +1691,7 @@ impl UsbController for EhciController {
             data.len()
         );
         let dev = self.get_device(device).ok_or(UsbError::DeviceNotFound)?;
-        let dev_copy = EhciDevice {
+        let dev_copy = UsbDevice {
             address: dev.address,
             port: dev.port,
             speed: dev.speed,

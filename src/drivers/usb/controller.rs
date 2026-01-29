@@ -591,6 +591,80 @@ pub struct DeviceInfo {
 }
 
 // ============================================================================
+// Common USB Device State
+// ============================================================================
+
+/// Common USB device state shared across EHCI/OHCI/UHCI controllers
+///
+/// This struct contains all the device information that is common to USB 1.1/2.0
+/// host controllers. xHCI uses a different model (slots) but can embed this
+/// for the device-level information.
+#[derive(Clone)]
+pub struct UsbDevice {
+    /// Device address (1-127, 0 = default address before SET_ADDRESS)
+    pub address: u8,
+    /// Port number (0-based)
+    pub port: u8,
+    /// Device speed
+    pub speed: UsbSpeed,
+    /// Device descriptor
+    pub device_desc: DeviceDescriptor,
+    /// Configuration info (parsed from configuration descriptor)
+    pub config_info: ConfigurationInfo,
+    /// Is mass storage device
+    pub is_mass_storage: bool,
+    /// Is HID keyboard
+    pub is_hid_keyboard: bool,
+    /// Bulk IN endpoint
+    pub bulk_in: Option<EndpointInfo>,
+    /// Bulk OUT endpoint
+    pub bulk_out: Option<EndpointInfo>,
+    /// Interrupt IN endpoint
+    pub interrupt_in: Option<EndpointInfo>,
+    /// Control endpoint max packet size
+    pub ep0_max_packet: u16,
+    /// Data toggle for bulk IN
+    pub bulk_in_toggle: bool,
+    /// Data toggle for bulk OUT
+    pub bulk_out_toggle: bool,
+}
+
+impl UsbDevice {
+    /// Create a new device with default state
+    pub fn new(address: u8, port: u8, speed: UsbSpeed) -> Self {
+        Self {
+            address,
+            port,
+            speed,
+            device_desc: DeviceDescriptor::default(),
+            config_info: ConfigurationInfo::default(),
+            is_mass_storage: false,
+            is_hid_keyboard: false,
+            bulk_in: None,
+            bulk_out: None,
+            interrupt_in: None,
+            ep0_max_packet: speed.default_max_packet_size(),
+            bulk_in_toggle: false,
+            bulk_out_toggle: false,
+        }
+    }
+
+    /// Get DeviceInfo for this device
+    pub fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            address: self.address,
+            speed: self.speed,
+            vendor_id: self.device_desc.vendor_id,
+            product_id: self.device_desc.product_id,
+            device_class: self.device_desc.device_class,
+            is_mass_storage: self.is_mass_storage,
+            is_hid: self.is_hid_keyboard,
+            is_keyboard: self.is_hid_keyboard,
+        }
+    }
+}
+
+// ============================================================================
 // Interrupt Queue Management
 // ============================================================================
 

@@ -51,6 +51,55 @@ pub enum UsbControllerHandle {
 // Safety: Controllers are only accessed with proper synchronization
 unsafe impl Send for UsbControllerHandle {}
 
+/// Macro to dispatch to the appropriate controller type
+///
+/// This reduces repetition when implementing functions that need to work
+/// with any USB controller type through the UsbController trait.
+macro_rules! with_usb_controller {
+    // Mutable access version
+    ($handle:expr, mut |$controller:ident| $body:expr) => {
+        match $handle {
+            UsbControllerHandle::Xhci(ptr) => {
+                let $controller = unsafe { &mut **ptr };
+                $body
+            }
+            UsbControllerHandle::Ehci(ptr) => {
+                let $controller = unsafe { &mut **ptr };
+                $body
+            }
+            UsbControllerHandle::Ohci(ptr) => {
+                let $controller = unsafe { &mut **ptr };
+                $body
+            }
+            UsbControllerHandle::Uhci(ptr) => {
+                let $controller = unsafe { &mut **ptr };
+                $body
+            }
+        }
+    };
+    // Immutable access version
+    ($handle:expr, |$controller:ident| $body:expr) => {
+        match $handle {
+            UsbControllerHandle::Xhci(ptr) => {
+                let $controller = unsafe { &**ptr };
+                $body
+            }
+            UsbControllerHandle::Ehci(ptr) => {
+                let $controller = unsafe { &**ptr };
+                $body
+            }
+            UsbControllerHandle::Ohci(ptr) => {
+                let $controller = unsafe { &**ptr };
+                $body
+            }
+            UsbControllerHandle::Uhci(ptr) => {
+                let $controller = unsafe { &**ptr };
+                $body
+            }
+        }
+    };
+}
+
 /// Global list of all USB controllers
 static ALL_CONTROLLERS: Mutex<heapless::Vec<UsbControllerHandle, 8>> =
     Mutex::new(heapless::Vec::new());
@@ -220,32 +269,16 @@ fn init_keyboards() {
     let controllers = ALL_CONTROLLERS.lock();
 
     for (idx, handle) in controllers.iter().enumerate() {
-        match handle {
-            UsbControllerHandle::Xhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
-                    log::debug!("No HID keyboard on xHCI controller {}: {:?}", idx, e);
-                }
+        with_usb_controller!(handle, mut |controller| {
+            if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
+                log::debug!(
+                    "No HID keyboard on {} controller {}: {:?}",
+                    controller.controller_type(),
+                    idx,
+                    e
+                );
             }
-            UsbControllerHandle::Ehci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
-                    log::debug!("No HID keyboard on EHCI controller {}: {:?}", idx, e);
-                }
-            }
-            UsbControllerHandle::Ohci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
-                    log::debug!("No HID keyboard on OHCI controller {}: {:?}", idx, e);
-                }
-            }
-            UsbControllerHandle::Uhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                if let Err(e) = hid_keyboard::init_keyboard(controller, idx) {
-                    log::debug!("No HID keyboard on UHCI controller {}: {:?}", idx, e);
-                }
-            }
-        }
+        });
     }
 }
 
@@ -260,24 +293,9 @@ pub fn cleanup() {
     let mut controllers = ALL_CONTROLLERS.lock();
 
     for handle in controllers.iter_mut() {
-        match handle {
-            UsbControllerHandle::Xhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                controller.cleanup();
-            }
-            UsbControllerHandle::Ehci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                controller.cleanup();
-            }
-            UsbControllerHandle::Ohci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                controller.cleanup();
-            }
-            UsbControllerHandle::Uhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                controller.cleanup();
-            }
-        }
+        with_usb_controller!(handle, mut |controller| {
+            controller.cleanup();
+        });
     }
 
     // Also clean up any xHCI controllers from the legacy init path
@@ -298,24 +316,7 @@ pub fn find_mass_storage() -> Option<(usize, u8)> {
     let controllers = ALL_CONTROLLERS.lock();
 
     for (idx, handle) in controllers.iter().enumerate() {
-        let device = match handle {
-            UsbControllerHandle::Xhci(ptr) => {
-                let controller = unsafe { &**ptr };
-                controller.find_mass_storage()
-            }
-            UsbControllerHandle::Ehci(ptr) => {
-                let controller = unsafe { &**ptr };
-                controller.find_mass_storage()
-            }
-            UsbControllerHandle::Ohci(ptr) => {
-                let controller = unsafe { &**ptr };
-                controller.find_mass_storage()
-            }
-            UsbControllerHandle::Uhci(ptr) => {
-                let controller = unsafe { &**ptr };
-                controller.find_mass_storage()
-            }
-        };
+        let device = with_usb_controller!(handle, |controller| controller.find_mass_storage());
 
         if let Some(addr) = device {
             return Some((idx, addr));
@@ -329,30 +330,15 @@ pub fn find_mass_storage() -> Option<(usize, u8)> {
 pub fn poll_keyboards() {
     let controllers = ALL_CONTROLLERS.lock();
 
-    for (idx, handle) in controllers.iter().enumerate() {
+    for (_idx, handle) in controllers.iter().enumerate() {
         // Only poll the controller that has the keyboard
         if !hid_keyboard::is_available() {
             continue;
         }
 
-        match handle {
-            UsbControllerHandle::Xhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                hid_keyboard::poll(controller);
-            }
-            UsbControllerHandle::Ehci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                hid_keyboard::poll(controller);
-            }
-            UsbControllerHandle::Ohci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                hid_keyboard::poll(controller);
-            }
-            UsbControllerHandle::Uhci(ptr) => {
-                let controller = unsafe { &mut **ptr };
-                hid_keyboard::poll(controller);
-            }
-        }
+        with_usb_controller!(handle, mut |controller| {
+            hid_keyboard::poll(controller);
+        });
     }
 }
 
@@ -378,24 +364,7 @@ where
     let controllers = ALL_CONTROLLERS.lock();
     let handle = controllers.get(index)?;
 
-    let result = match handle {
-        UsbControllerHandle::Xhci(ptr) => {
-            let controller = unsafe { &mut **ptr };
-            f(controller)
-        }
-        UsbControllerHandle::Ehci(ptr) => {
-            let controller = unsafe { &mut **ptr };
-            f(controller)
-        }
-        UsbControllerHandle::Ohci(ptr) => {
-            let controller = unsafe { &mut **ptr };
-            f(controller)
-        }
-        UsbControllerHandle::Uhci(ptr) => {
-            let controller = unsafe { &mut **ptr };
-            f(controller)
-        }
-    };
+    let result = with_usb_controller!(handle, mut |controller| f(controller));
 
     Some(result)
 }
