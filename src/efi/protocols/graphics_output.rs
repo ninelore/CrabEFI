@@ -5,10 +5,10 @@
 //! coreboot tables.
 
 use r_efi::efi::{Guid, Status};
-use spin::Mutex;
 
 use crate::coreboot::FramebufferInfo;
 use crate::efi::allocator::{allocate_pool, MemoryType};
+use crate::state;
 
 /// EFI_GRAPHICS_OUTPUT_PROTOCOL GUID
 pub const GRAPHICS_OUTPUT_GUID: Guid = Guid::from_fields(
@@ -128,14 +128,6 @@ pub struct GraphicsOutputProtocol {
     pub mode: *mut GopMode,
 }
 
-/// Internal GOP state stored alongside the protocol
-struct GopState {
-    framebuffer: FramebufferInfo,
-}
-
-/// Global GOP state (we only support one display)
-static GOP_STATE: Mutex<Option<GopState>> = Mutex::new(None);
-
 /// Query available video mode information
 extern "efiapi" fn gop_query_mode(
     this: *mut GraphicsOutputProtocol,
@@ -231,13 +223,11 @@ extern "efiapi" fn gop_blt(
         return Status::INVALID_PARAMETER;
     }
 
-    let state_guard = GOP_STATE.lock();
-    let gop_state = match state_guard.as_ref() {
-        Some(state) => state,
+    let console = state::console();
+    let fb = match console.gop_framebuffer.as_ref() {
+        Some(fb) => fb,
         None => return Status::DEVICE_ERROR,
     };
-
-    let fb = &gop_state.framebuffer;
     let fb_width = fb.x_resolution as usize;
     let fb_height = fb.y_resolution as usize;
     let fb_ptr = fb.physical_address as *mut u8;
@@ -575,12 +565,7 @@ pub fn create_gop(framebuffer: &FramebufferInfo) -> *mut GraphicsOutputProtocol 
     }
 
     // Store global state for Blt operations
-    {
-        let mut state = GOP_STATE.lock();
-        *state = Some(GopState {
-            framebuffer: framebuffer.clone(),
-        });
-    }
+    state::console_mut().gop_framebuffer = Some(framebuffer.clone());
 
     log::info!(
         "GraphicsOutputProtocol created: {}x{} @ {:#x}, {:?}",

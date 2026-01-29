@@ -7,55 +7,14 @@ use core::ffi::c_void;
 use r_efi::efi::{
     self, CapsuleHeader, Guid, ResetType, Status, TableHeader, Time, TimeCapabilities,
 };
-use spin::Mutex;
+
+use crate::state::{self, MAX_VARIABLES, MAX_VARIABLE_DATA_SIZE, MAX_VARIABLE_NAME_LEN};
 
 /// Runtime Services signature "RUNTSERV"
 const EFI_RUNTIME_SERVICES_SIGNATURE: u64 = 0x56524553544E5552;
 
 /// Runtime Services revision
 const EFI_RUNTIME_SERVICES_REVISION: u32 = (2 << 16) | 100;
-
-/// Maximum number of EFI variables we can store
-const MAX_VARIABLES: usize = 64;
-
-/// Maximum variable name length (in characters)
-const MAX_VARIABLE_NAME_LEN: usize = 64;
-
-/// Maximum variable data size
-const MAX_VARIABLE_DATA_SIZE: usize = 1024;
-
-/// EFI Variable entry
-struct VariableEntry {
-    /// Variable name (UCS-2, null-terminated)
-    name: [u16; MAX_VARIABLE_NAME_LEN],
-    /// Vendor GUID
-    vendor_guid: Guid,
-    /// Variable attributes
-    attributes: u32,
-    /// Data
-    data: [u8; MAX_VARIABLE_DATA_SIZE],
-    /// Data size
-    data_size: usize,
-    /// Whether this entry is in use
-    in_use: bool,
-}
-
-impl VariableEntry {
-    const fn empty() -> Self {
-        Self {
-            name: [0u16; MAX_VARIABLE_NAME_LEN],
-            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            attributes: 0,
-            data: [0u8; MAX_VARIABLE_DATA_SIZE],
-            data_size: 0,
-            in_use: false,
-        }
-    }
-}
-
-/// Variable store
-static VARIABLES: Mutex<[VariableEntry; MAX_VARIABLES]> =
-    Mutex::new([const { VariableEntry::empty() }; MAX_VARIABLES]);
 
 /// Static runtime services table
 static mut RUNTIME_SERVICES: efi::RuntimeServices = efi::RuntimeServices {
@@ -188,7 +147,8 @@ extern "efiapi" fn get_variable(
 
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
-    let variables = VARIABLES.lock();
+    let efi = state::efi();
+    let variables = &efi.variables;
 
     // Find the variable
     for var in variables.iter() {
@@ -230,7 +190,8 @@ extern "efiapi" fn get_next_variable_name(
         return Status::INVALID_PARAMETER;
     }
 
-    let variables = VARIABLES.lock();
+    let efi = state::efi();
+    let variables = &efi.variables;
     let current_name = variable_name;
     let current_guid = unsafe { *vendor_guid };
 
@@ -285,7 +246,8 @@ extern "efiapi" fn set_variable(
 
     let name = variable_name;
     let guid = unsafe { *vendor_guid };
-    let mut variables = VARIABLES.lock();
+    let efi = state::efi_mut();
+    let variables = &mut efi.variables;
 
     // Check name length
     let name_len = ucs2_strlen_ptr(name);
@@ -376,7 +338,8 @@ extern "efiapi" fn query_variable_info(
     // We don't really care about attributes for our in-memory store
     let _ = attributes;
 
-    let variables = VARIABLES.lock();
+    let efi = state::efi();
+    let variables = &efi.variables;
     let total_size = MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE;
     let mut used_size = 0usize;
 

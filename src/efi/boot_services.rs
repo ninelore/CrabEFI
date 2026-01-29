@@ -2,30 +2,29 @@
 //!
 //! This module implements the EFI Boot Services table, which provides
 //! memory allocation, protocol handling, and image loading services.
+//!
+//! # State Management
+//!
+//! Boot Services state (handles, events, loaded images) is stored in the
+//! centralized `FirmwareState` structure. Access it via `crate::state::efi_mut()`.
 
 use super::allocator::{self, AllocateType, MemoryDescriptor, MemoryType};
 use super::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::system_table;
 use crate::pe;
+use crate::state::{
+    self, EventEntry, LoadedImageEntry, ProtocolEntry, MAX_EVENTS, MAX_HANDLES,
+    MAX_PROTOCOLS_PER_HANDLE,
+};
 use core::ffi::c_void;
 use r_efi::efi::{self, Boolean, Guid, Handle, Status, SystemTable, TableHeader, Tpl};
 use r_efi::protocols::device_path::Protocol as DevicePathProtocol;
-use spin::Mutex;
 
 /// Boot Services signature "BOOTSERV"
 const EFI_BOOT_SERVICES_SIGNATURE: u64 = 0x56524553544F4F42;
 
 /// Boot Services revision (matches system table)
 const EFI_BOOT_SERVICES_REVISION: u32 = (2 << 16) | 100;
-
-/// Maximum number of handles we can track
-const MAX_HANDLES: usize = 64;
-
-/// Maximum number of protocols per handle
-const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
-
-/// Maximum number of events we can track
-const MAX_EVENTS: usize = 32;
 
 /// Event types
 pub const EVT_TIMER: u32 = 0x80000000;
@@ -37,121 +36,6 @@ pub const EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE: u32 = 0x60000202;
 
 /// Special event ID for keyboard input
 pub const KEYBOARD_EVENT_ID: usize = 1;
-
-/// Protocol interface entry
-#[derive(Clone, Copy)]
-struct ProtocolEntry {
-    guid: Guid,
-    interface: *mut c_void,
-}
-
-// Safety: ProtocolEntry contains raw pointers but we only access them
-// while holding the HANDLES lock, ensuring thread safety.
-unsafe impl Send for ProtocolEntry {}
-
-impl ProtocolEntry {
-    const fn empty() -> Self {
-        Self {
-            guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            interface: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// Handle entry
-struct HandleEntry {
-    handle: Handle,
-    protocols: [ProtocolEntry; MAX_PROTOCOLS_PER_HANDLE],
-    protocol_count: usize,
-}
-
-// Safety: HandleEntry contains raw pointers but we only access them
-// while holding the HANDLES lock, ensuring thread safety.
-unsafe impl Send for HandleEntry {}
-
-impl HandleEntry {
-    const fn empty() -> Self {
-        Self {
-            handle: core::ptr::null_mut(),
-            protocols: [ProtocolEntry::empty(); MAX_PROTOCOLS_PER_HANDLE],
-            protocol_count: 0,
-        }
-    }
-}
-
-/// Event entry for tracking created events
-#[derive(Clone, Copy)]
-struct EventEntry {
-    event_type: u32,
-    notify_tpl: Tpl,
-    signaled: bool,
-    is_keyboard_event: bool,
-}
-
-impl EventEntry {
-    const fn empty() -> Self {
-        Self {
-            event_type: 0,
-            notify_tpl: 0,
-            signaled: false,
-            is_keyboard_event: false,
-        }
-    }
-}
-
-/// Handle database
-static HANDLES: Mutex<[HandleEntry; MAX_HANDLES]> =
-    Mutex::new([const { HandleEntry::empty() }; MAX_HANDLES]);
-static HANDLE_COUNT: Mutex<usize> = Mutex::new(0);
-
-/// Next handle value (used as a unique identifier)
-static NEXT_HANDLE: Mutex<usize> = Mutex::new(1);
-
-/// Event database
-static EVENTS: Mutex<[EventEntry; MAX_EVENTS]> =
-    Mutex::new([const { EventEntry::empty() }; MAX_EVENTS]);
-static NEXT_EVENT_ID: Mutex<usize> = Mutex::new(2); // Start at 2, reserve 1 for keyboard
-
-/// Maximum number of loaded images we can track
-const MAX_LOADED_IMAGES: usize = 16;
-
-/// Loaded image entry - tracks PE images loaded via LoadImage
-#[derive(Clone, Copy)]
-struct LoadedImageEntry {
-    /// Handle for this loaded image
-    handle: Handle,
-    /// Base address where image was loaded
-    image_base: u64,
-    /// Size of the loaded image in bytes
-    image_size: u64,
-    /// Entry point address
-    entry_point: u64,
-    /// Number of pages allocated
-    num_pages: u64,
-    /// Parent image handle that loaded this image
-    parent_handle: Handle,
-}
-
-// Safety: LoadedImageEntry contains raw pointers but we only access them
-// while holding the LOADED_IMAGES lock, ensuring thread safety.
-unsafe impl Send for LoadedImageEntry {}
-
-impl LoadedImageEntry {
-    const fn empty() -> Self {
-        Self {
-            handle: core::ptr::null_mut(),
-            image_base: 0,
-            image_size: 0,
-            entry_point: 0,
-            num_pages: 0,
-            parent_handle: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// Loaded images database - maps handles to their PE image info
-static LOADED_IMAGES: Mutex<[LoadedImageEntry; MAX_LOADED_IMAGES]> =
-    Mutex::new([const { LoadedImageEntry::empty() }; MAX_LOADED_IMAGES]);
 
 /// Static boot services table
 static mut BOOT_SERVICES: efi::BootServices = efi::BootServices {
@@ -429,27 +313,24 @@ extern "efiapi" fn create_event(
         return Status::INVALID_PARAMETER;
     }
 
-    // Allocate an event ID
-    let mut next_id = NEXT_EVENT_ID.lock();
-    let event_id = *next_id;
+    // Allocate an event ID from centralized state
+    let efi_state = state::efi_mut();
+    let event_id = efi_state.next_event_id;
 
     if event_id >= MAX_EVENTS {
         log::error!("  -> OUT_OF_RESOURCES (no more event slots)");
         return Status::OUT_OF_RESOURCES;
     }
 
-    *next_id += 1;
-    drop(next_id);
+    efi_state.next_event_id += 1;
 
     // Store event info
-    let mut events = EVENTS.lock();
-    events[event_id] = EventEntry {
+    efi_state.events[event_id] = EventEntry {
         event_type,
         notify_tpl,
         signaled: false,
         is_keyboard_event: false,
     };
-    drop(events);
 
     // Return the event ID as the event handle
     unsafe {
@@ -517,9 +398,8 @@ extern "efiapi" fn wait_for_event(
 
             // Check if a regular event is signaled
             if event_id > 0 && event_id < MAX_EVENTS {
-                let events = EVENTS.lock();
-                if events[event_id].signaled {
-                    drop(events);
+                let efi_state = state::efi();
+                if efi_state.events[event_id].signaled {
                     unsafe { *index = i };
                     log::debug!("  -> SUCCESS (event signaled, index={})", i);
                     return Status::SUCCESS;
@@ -539,8 +419,8 @@ extern "efiapi" fn signal_event(event: efi::Event) -> Status {
     log::debug!("BS.SignalEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        let mut events = EVENTS.lock();
-        events[event_id].signaled = true;
+        let efi_state = state::efi_mut();
+        efi_state.events[event_id].signaled = true;
     }
 
     Status::SUCCESS
@@ -551,8 +431,8 @@ extern "efiapi" fn close_event(event: efi::Event) -> Status {
     log::debug!("BS.CloseEvent(event={})", event_id);
 
     if event_id > 0 && event_id < MAX_EVENTS {
-        let mut events = EVENTS.lock();
-        events[event_id] = EventEntry::empty();
+        let efi_state = state::efi_mut();
+        efi_state.events[event_id] = EventEntry::empty();
     }
 
     Status::SUCCESS
@@ -574,8 +454,8 @@ extern "efiapi" fn check_event(event: efi::Event) -> Status {
 
     // Check regular events
     if event_id > 0 && event_id < MAX_EVENTS {
-        let events = EVENTS.lock();
-        if events[event_id].signaled {
+        let efi_state = state::efi();
+        if efi_state.events[event_id].signaled {
             return Status::SUCCESS;
         }
     }
@@ -623,46 +503,45 @@ extern "efiapi" fn install_protocol_interface(
     let guid = unsafe { *protocol };
     let handle_ptr = unsafe { *handle };
 
-    let mut handles = HANDLES.lock();
-    let mut count = HANDLE_COUNT.lock();
+    let efi_state = state::efi_mut();
 
     // If handle is null, create a new handle
     if handle_ptr.is_null() {
-        if *count >= MAX_HANDLES {
+        if efi_state.handle_count >= MAX_HANDLES {
             return Status::OUT_OF_RESOURCES;
         }
 
-        let mut next = NEXT_HANDLE.lock();
-        let new_handle = *next as *mut c_void;
-        *next += 1;
+        let new_handle = efi_state.next_handle as *mut c_void;
+        efi_state.next_handle += 1;
 
-        handles[*count].handle = new_handle;
-        handles[*count].protocols[0] = ProtocolEntry { guid, interface };
-        handles[*count].protocol_count = 1;
-        *count += 1;
+        let idx = efi_state.handle_count;
+        efi_state.handles[idx].handle = new_handle;
+        efi_state.handles[idx].protocols[0] = ProtocolEntry { guid, interface };
+        efi_state.handles[idx].protocol_count = 1;
+        efi_state.handle_count += 1;
 
         unsafe { *handle = new_handle };
         return Status::SUCCESS;
     }
 
     // Find existing handle
-    for i in 0..*count {
-        if handles[i].handle == handle_ptr {
+    for i in 0..efi_state.handle_count {
+        if efi_state.handles[i].handle == handle_ptr {
             // Check if protocol already installed
-            for j in 0..handles[i].protocol_count {
-                if guid_eq(&handles[i].protocols[j].guid, &guid) {
+            for j in 0..efi_state.handles[i].protocol_count {
+                if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
                     return Status::INVALID_PARAMETER; // Protocol already installed
                 }
             }
 
             // Add new protocol
-            if handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+            if efi_state.handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
                 return Status::OUT_OF_RESOURCES;
             }
 
-            let idx = handles[i].protocol_count;
-            handles[i].protocols[idx] = ProtocolEntry { guid, interface };
-            handles[i].protocol_count += 1;
+            let proto_idx = efi_state.handles[i].protocol_count;
+            efi_state.handles[i].protocols[proto_idx] = ProtocolEntry { guid, interface };
+            efi_state.handles[i].protocol_count += 1;
             return Status::SUCCESS;
         }
     }
@@ -768,15 +647,14 @@ extern "efiapi" fn locate_handle(
     }
 
     let guid = unsafe { *protocol };
-    let handles = HANDLES.lock();
-    let count = HANDLE_COUNT.lock();
+    let efi_state = state::efi();
 
     // Count matching handles
     let mut matching: heapless::Vec<Handle, MAX_HANDLES> = heapless::Vec::new();
-    for i in 0..*count {
-        for j in 0..handles[i].protocol_count {
-            if guid_eq(&handles[i].protocols[j].guid, &guid) {
-                let _ = matching.push(handles[i].handle);
+    for i in 0..efi_state.handle_count {
+        for j in 0..efi_state.handles[i].protocol_count {
+            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
+                let _ = matching.push(efi_state.handles[i].handle);
                 break;
             }
         }
@@ -828,23 +706,22 @@ extern "efiapi" fn locate_device_path(
     }
 
     // Find all handles with the specified protocol
-    let handles = HANDLES.lock();
-    let count = HANDLE_COUNT.lock();
+    let efi_state = state::efi();
 
-    for i in 0..*count {
+    for i in 0..efi_state.handle_count {
         let mut has_protocol = false;
         let mut handle_dp: *mut DevicePathProtocol = core::ptr::null_mut();
 
-        for j in 0..handles[i].protocol_count {
-            if guid_eq(&handles[i].protocols[j].guid, &guid) {
+        for j in 0..efi_state.handles[i].protocol_count {
+            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
                 has_protocol = true;
             }
             // Also look for DEVICE_PATH protocol to get the device path
             if guid_eq(
-                &handles[i].protocols[j].guid,
+                &efi_state.handles[i].protocols[j].guid,
                 &r_efi::protocols::device_path::PROTOCOL_GUID,
             ) {
-                handle_dp = handles[i].protocols[j].interface as *mut DevicePathProtocol;
+                handle_dp = efi_state.handles[i].protocols[j].interface as *mut DevicePathProtocol;
             }
         }
 
@@ -854,11 +731,11 @@ extern "efiapi" fn locate_device_path(
 
             log::debug!(
                 "  -> SUCCESS (handle={:?}, device_path={:?})",
-                handles[i].handle,
+                efi_state.handles[i].handle,
                 handle_dp
             );
             unsafe {
-                *device = handles[i].handle;
+                *device = efi_state.handles[i].handle;
                 // Update device_path to point to the End node of the handle's device path.
                 // The LoadFile2 protocol expects the remaining path after the match.
                 // Walk to the end of the device path and point to the End node.
@@ -1002,9 +879,9 @@ extern "efiapi" fn load_image(
 
     // Store the loaded image info so StartImage can find it
     {
-        let mut images = LOADED_IMAGES.lock();
+        let efi_state = state::efi_mut();
         let mut stored = false;
-        for entry in images.iter_mut() {
+        for entry in efi_state.loaded_images.iter_mut() {
             if entry.handle.is_null() {
                 entry.handle = new_handle;
                 entry.image_base = loaded_image.image_base;
@@ -1045,8 +922,8 @@ fn get_device_handle_from_parent(parent_handle: Handle) -> Handle {
     }
 
     // Try to get the LoadedImageProtocol from the parent
-    let handles = HANDLES.lock();
-    for entry in handles.iter() {
+    let efi_state = state::efi();
+    for entry in efi_state.handles.iter() {
         if entry.handle == parent_handle {
             for proto in &entry.protocols[..entry.protocol_count] {
                 if proto.guid == LOADED_IMAGE_PROTOCOL_GUID && !proto.interface.is_null() {
@@ -1076,9 +953,9 @@ extern "efiapi" fn start_image(
 
     // Find the loaded image entry
     let (entry_point, image_base) = {
-        let images = LOADED_IMAGES.lock();
+        let efi_state = state::efi();
         let mut found = None;
-        for entry in images.iter() {
+        for entry in efi_state.loaded_images.iter() {
             if entry.handle == image_handle {
                 found = Some((entry.entry_point, entry.image_base));
                 break;
@@ -1158,9 +1035,9 @@ extern "efiapi" fn unload_image(image_handle: Handle) -> Status {
 
     // Find and remove the loaded image entry
     let image_info = {
-        let mut images = LOADED_IMAGES.lock();
+        let efi_state = state::efi_mut();
         let mut found = None;
-        for entry in images.iter_mut() {
+        for entry in efi_state.loaded_images.iter_mut() {
             if entry.handle == image_handle {
                 found = Some((entry.image_base, entry.num_pages));
                 // Clear the entry
@@ -1303,14 +1180,13 @@ extern "efiapi" fn open_protocol(
         log_guid(&guid);
     }
 
-    let handles = HANDLES.lock();
-    let count = HANDLE_COUNT.lock();
+    let efi_state = state::efi();
 
-    for i in 0..*count {
-        if handles[i].handle == handle {
-            for j in 0..handles[i].protocol_count {
-                if guid_eq(&handles[i].protocols[j].guid, &guid) {
-                    let iface = handles[i].protocols[j].interface;
+    for i in 0..efi_state.handle_count {
+        if efi_state.handles[i].handle == handle {
+            for j in 0..efi_state.handles[i].protocol_count {
+                if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
+                    let iface = efi_state.handles[i].protocols[j].interface;
                     if !interface.is_null() {
                         unsafe { *interface = iface };
                     }
@@ -1475,14 +1351,13 @@ extern "efiapi" fn locate_protocol(
         log_guid(&guid);
     }
 
-    let handles = HANDLES.lock();
-    let count = HANDLE_COUNT.lock();
+    let efi_state = state::efi();
 
     // Find first handle with this protocol
-    for i in 0..*count {
-        for j in 0..handles[i].protocol_count {
-            if guid_eq(&handles[i].protocols[j].guid, &guid) {
-                let iface = handles[i].protocols[j].interface;
+    for i in 0..efi_state.handle_count {
+        for j in 0..efi_state.handles[i].protocol_count {
+            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
+                let iface = efi_state.handles[i].protocols[j].interface;
                 unsafe { *interface = iface };
                 log::trace!("  -> SUCCESS (interface={:p})", iface);
                 return Status::SUCCESS;
@@ -1616,18 +1491,18 @@ extern "efiapi" fn uninstall_multiple_protocol_interfaces(
         log::debug!("  Uninstalling protocol: {}", guid_name);
 
         // Find and remove the protocol from the handle
-        let mut handles = HANDLES.lock();
-        let count = HANDLE_COUNT.lock();
+        let efi_state = state::efi_mut();
 
-        for i in 0..*count {
-            if handles[i].handle == handle {
-                for j in 0..handles[i].protocol_count {
-                    if guid_eq(&handles[i].protocols[j].guid, &guid) {
+        for i in 0..efi_state.handle_count {
+            if efi_state.handles[i].handle == handle {
+                for j in 0..efi_state.handles[i].protocol_count {
+                    if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
                         // Remove by shifting remaining protocols down
-                        for k in j..handles[i].protocol_count - 1 {
-                            handles[i].protocols[k] = handles[i].protocols[k + 1];
+                        for k in j..efi_state.handles[i].protocol_count - 1 {
+                            efi_state.handles[i].protocols[k] =
+                                efi_state.handles[i].protocols[k + 1];
                         }
-                        handles[i].protocol_count -= 1;
+                        efi_state.handles[i].protocol_count -= 1;
                         break;
                     }
                 }
@@ -2021,48 +1896,46 @@ fn format_guid(guid: &Guid) -> &'static str {
 
 /// Create a new handle and register it
 pub fn create_handle() -> Option<Handle> {
-    let mut handles = HANDLES.lock();
-    let mut count = HANDLE_COUNT.lock();
+    let efi_state = state::efi_mut();
 
-    if *count >= MAX_HANDLES {
+    if efi_state.handle_count >= MAX_HANDLES {
         return None;
     }
 
-    let mut next = NEXT_HANDLE.lock();
-    let handle = *next as *mut c_void;
-    *next += 1;
+    let handle = efi_state.next_handle as *mut c_void;
+    efi_state.next_handle += 1;
 
-    handles[*count].handle = handle;
-    handles[*count].protocol_count = 0;
-    *count += 1;
+    let idx = efi_state.handle_count;
+    efi_state.handles[idx].handle = handle;
+    efi_state.handles[idx].protocol_count = 0;
+    efi_state.handle_count += 1;
 
     Some(handle)
 }
 
 /// Install a protocol on an existing handle
 pub fn install_protocol(handle: Handle, guid: &Guid, interface: *mut c_void) -> Status {
-    let mut handles = HANDLES.lock();
-    let count = HANDLE_COUNT.lock();
+    let efi_state = state::efi_mut();
 
-    for i in 0..*count {
-        if handles[i].handle == handle {
+    for i in 0..efi_state.handle_count {
+        if efi_state.handles[i].handle == handle {
             // Check if protocol already installed
-            for j in 0..handles[i].protocol_count {
-                if guid_eq(&handles[i].protocols[j].guid, guid) {
+            for j in 0..efi_state.handles[i].protocol_count {
+                if guid_eq(&efi_state.handles[i].protocols[j].guid, guid) {
                     return Status::INVALID_PARAMETER;
                 }
             }
 
-            if handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
+            if efi_state.handles[i].protocol_count >= MAX_PROTOCOLS_PER_HANDLE {
                 return Status::OUT_OF_RESOURCES;
             }
 
-            let idx = handles[i].protocol_count;
-            handles[i].protocols[idx] = ProtocolEntry {
+            let proto_idx = efi_state.handles[i].protocol_count;
+            efi_state.handles[i].protocols[proto_idx] = ProtocolEntry {
                 guid: *guid,
                 interface,
             };
-            handles[i].protocol_count += 1;
+            efi_state.handles[i].protocol_count += 1;
             return Status::SUCCESS;
         }
     }

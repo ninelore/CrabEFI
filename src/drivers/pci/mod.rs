@@ -4,7 +4,8 @@
 //! It supports both legacy I/O port-based access (CAM) and memory-mapped access (ECAM).
 
 use heapless::Vec;
-use spin::Mutex;
+
+use crate::state;
 
 #[cfg(target_arch = "x86_64")]
 use x86_64::instructions::port::{Port, PortWriteOnly};
@@ -44,12 +45,6 @@ const HEADER_TYPE_NORMAL: u8 = 0x00;
 const HEADER_TYPE_BRIDGE: u8 = 0x01;
 const HEADER_TYPE_CARDBUS: u8 = 0x02;
 const HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
-
-/// Global PCI device list
-static PCI_DEVICES: Mutex<Vec<PciDevice, MAX_PCI_DEVICES>> = Mutex::new(Vec::new());
-
-/// ECAM base address (set from ACPI MCFG table)
-static ECAM_BASE: Mutex<Option<u64>> = Mutex::new(None);
 
 /// PCI device location (Bus:Device.Function)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +378,8 @@ pub fn enable_device(dev: &PciDevice) {
 pub fn init() {
     log::info!("Initializing PCI subsystem...");
 
-    let mut devices = PCI_DEVICES.lock();
+    let drivers = state::drivers_mut();
+    let devices = &mut drivers.pci_devices;
     devices.clear();
 
     // Scan all buses, devices, and functions
@@ -436,7 +432,8 @@ pub fn init() {
 
 /// Find all NVMe controllers
 pub fn find_nvme_controllers() -> Vec<PciDevice, 8> {
-    let devices = PCI_DEVICES.lock();
+    let drivers = state::drivers();
+    let devices = &drivers.pci_devices;
     let mut nvme_devices = Vec::new();
 
     for dev in devices.iter() {
@@ -456,7 +453,8 @@ pub fn find_nvme_controllers() -> Vec<PciDevice, 8> {
 
 /// Find all AHCI controllers
 pub fn find_ahci_controllers() -> Vec<PciDevice, 8> {
-    let devices = PCI_DEVICES.lock();
+    let drivers = state::drivers();
+    let devices = &drivers.pci_devices;
     let mut ahci_devices = Vec::new();
 
     for dev in devices.iter() {
@@ -476,12 +474,13 @@ pub fn find_ahci_controllers() -> Vec<PciDevice, 8> {
 
 /// Get all enumerated PCI devices
 pub fn get_all_devices() -> Vec<PciDevice, MAX_PCI_DEVICES> {
-    PCI_DEVICES.lock().clone()
+    state::drivers().pci_devices.clone()
 }
 
 /// Print information about all PCI devices
 pub fn print_devices() {
-    let devices = PCI_DEVICES.lock();
+    let drivers = state::drivers();
+    let devices = &drivers.pci_devices;
 
     log::info!("PCI Devices:");
     for dev in devices.iter() {
@@ -512,7 +511,7 @@ pub fn print_devices() {
 
 /// Set ECAM base address (from ACPI MCFG table)
 pub fn set_ecam_base(base: u64) {
-    *ECAM_BASE.lock() = Some(base);
+    state::drivers_mut().ecam_base = Some(base);
     log::debug!("ECAM base set to {:#x}", base);
 }
 

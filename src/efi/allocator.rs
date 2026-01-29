@@ -3,11 +3,16 @@
 //! This module implements page-granular memory allocation compatible with the
 //! EFI AllocatePages/FreePages API. Memory is tracked using a sorted list of
 //! memory descriptors.
+//!
+//! # State Management
+//!
+//! The allocator state is stored in the centralized `FirmwareState` structure.
+//! Access it via `crate::state::allocator()` or `crate::state::allocator_mut()`.
 
 use crate::coreboot::memory::{MemoryRegion, MemoryType as CbMemoryType};
+use crate::state;
 use heapless::Vec;
 use r_efi::efi;
-use spin::Mutex;
 
 /// Maximum number of memory map entries we can track
 const MAX_MEMORY_ENTRIES: usize = 256;
@@ -777,12 +782,9 @@ impl MemoryAllocator {
     }
 }
 
-/// Global memory allocator instance
-static ALLOCATOR: Mutex<MemoryAllocator> = Mutex::new(MemoryAllocator::new());
-
 /// Initialize the global allocator from coreboot memory map
 pub fn init(regions: &[MemoryRegion]) {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.init_from_coreboot(regions);
 }
 
@@ -792,7 +794,7 @@ pub fn reserve_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.reserve_region(physical_start, num_pages, memory_type)
 }
 
@@ -804,7 +806,7 @@ pub fn force_add_region(
     num_pages: u64,
     memory_type: MemoryType,
 ) -> Result<(), efi::Status> {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.force_add_region(physical_start, num_pages, memory_type)
 }
 
@@ -812,7 +814,7 @@ pub fn force_add_region(
 ///
 /// This properly splits existing regions and marks the specified range as AcpiReclaimMemory.
 pub fn mark_as_acpi_reclaim(addr: u64, num_pages: u64) -> Result<(), efi::Status> {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.mark_as_acpi_reclaim(addr, num_pages)
 }
 
@@ -823,25 +825,25 @@ pub fn allocate_pages(
     num_pages: u64,
     memory: &mut u64,
 ) -> efi::Status {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.allocate_pages(alloc_type, memory_type, num_pages, memory)
 }
 
 /// Free previously allocated pages
 pub fn free_pages(memory: u64, num_pages: u64) -> efi::Status {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.free_pages(memory, num_pages)
 }
 
 /// Get the memory map size
 pub fn get_memory_map_size() -> usize {
-    let alloc = ALLOCATOR.lock();
+    let alloc = state::allocator();
     alloc.entry_count() * core::mem::size_of::<MemoryDescriptor>()
 }
 
 /// Get current map key
 pub fn get_map_key() -> usize {
-    let alloc = ALLOCATOR.lock();
+    let alloc = state::allocator();
     alloc.map_key()
 }
 
@@ -850,7 +852,7 @@ pub fn get_map_key() -> usize {
 /// Returns the memory type if the address is within a known memory region,
 /// or None if the address is not in any known region.
 pub fn get_memory_type_at(address: u64) -> Option<MemoryType> {
-    let alloc = ALLOCATOR.lock();
+    let alloc = state::allocator();
     for entry in alloc.entries.iter() {
         if address >= entry.physical_start && address < entry.end() {
             return MemoryType::from_u32(entry.memory_type);
@@ -867,7 +869,7 @@ pub fn get_memory_map(
     descriptor_size: &mut usize,
     descriptor_version: &mut u32,
 ) -> efi::Status {
-    let alloc = ALLOCATOR.lock();
+    let alloc = state::allocator();
     alloc.get_memory_map(
         memory_map_size,
         memory_map,
@@ -879,7 +881,7 @@ pub fn get_memory_map(
 
 /// Exit boot services
 pub fn exit_boot_services(map_key: usize) -> efi::Status {
-    let mut alloc = ALLOCATOR.lock();
+    let alloc = state::allocator_mut();
     alloc.exit_boot_services(map_key)
 }
 

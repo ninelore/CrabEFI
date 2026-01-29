@@ -7,16 +7,14 @@ use core::ffi::c_void;
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
 use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
-use spin::Mutex;
+
+use crate::state::{self, ConfigurationTable, MAX_CONFIG_TABLES};
 
 /// EFI System Table signature "IBI SYST"
 const EFI_SYSTEM_TABLE_SIGNATURE: u64 = 0x5453595320494249;
 
 /// EFI System Table revision (2.100 = UEFI 2.10)
 const EFI_SYSTEM_TABLE_REVISION: u32 = (2 << 16) | 100;
-
-/// Maximum number of configuration tables
-const MAX_CONFIG_TABLES: usize = 16;
 
 /// ACPI 2.0 RSDP GUID
 pub const ACPI_20_TABLE_GUID: Guid = Guid::from_fields(
@@ -57,34 +55,6 @@ pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     0x2e,
     &[0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
 );
-
-/// EFI Configuration Table entry
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct ConfigurationTable {
-    /// GUID identifying the table
-    pub vendor_guid: Guid,
-    /// Pointer to the table
-    pub vendor_table: *mut c_void,
-}
-
-// Safety: ConfigurationTable contains raw pointers but we only access them
-// while holding the CONFIG_TABLES lock, ensuring thread safety.
-unsafe impl Send for ConfigurationTable {}
-
-impl ConfigurationTable {
-    pub const fn empty() -> Self {
-        Self {
-            vendor_guid: Guid::from_fields(0, 0, 0, 0, 0, &[0, 0, 0, 0, 0, 0]),
-            vendor_table: core::ptr::null_mut(),
-        }
-    }
-}
-
-/// Static storage for configuration tables
-static CONFIG_TABLES: Mutex<[ConfigurationTable; MAX_CONFIG_TABLES]> =
-    Mutex::new([ConfigurationTable::empty(); MAX_CONFIG_TABLES]);
-static CONFIG_TABLE_COUNT: Mutex<usize> = Mutex::new(0);
 
 /// EFI System Table
 ///
@@ -166,9 +136,8 @@ pub unsafe fn init(
     SYSTEM_TABLE.runtime_services = runtime_services;
 
     // Set up configuration table pointer
-    let tables = CONFIG_TABLES.lock();
-    SYSTEM_TABLE.configuration_table = tables.as_ptr() as *mut ConfigurationTable;
-    drop(tables);
+    let efi = state::efi();
+    SYSTEM_TABLE.configuration_table = efi.config_tables.as_ptr() as *mut ConfigurationTable;
 
     log::debug!("EFI System Table initialized");
 }
@@ -219,8 +188,9 @@ pub unsafe fn set_std_err(handle: Handle, protocol: *mut SimpleTextOutputProtoco
 /// If a table with the same GUID already exists, it will be updated.
 /// If vendor_table is null, the table entry will be removed.
 pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Status {
-    let mut tables = CONFIG_TABLES.lock();
-    let mut count = CONFIG_TABLE_COUNT.lock();
+    let efi = state::efi_mut();
+    let tables = &mut efi.config_tables;
+    let count = &mut efi.config_table_count;
 
     // First, check if this GUID already exists
     for i in 0..*count {
@@ -621,10 +591,10 @@ pub fn install_acpi_tables(rsdp: u64) {
     }
 
     // Log final configuration table state
-    let count = CONFIG_TABLE_COUNT.lock();
+    let count = state::efi().config_table_count;
     log::info!(
         "Configuration table has {} entries, SystemTable.number_of_table_entries = {}",
-        *count,
+        count,
         unsafe { SYSTEM_TABLE.number_of_table_entries }
     );
 }
@@ -640,11 +610,12 @@ pub fn update_crc32() {
 
 /// Dump configuration table entries for debugging
 pub fn dump_configuration_tables() {
-    let tables = CONFIG_TABLES.lock();
-    let count = CONFIG_TABLE_COUNT.lock();
+    let efi = state::efi();
+    let tables = &efi.config_tables;
+    let count = efi.config_table_count;
 
-    log::debug!("EFI Configuration Table ({} entries):", *count);
-    for i in 0..*count {
+    log::debug!("EFI Configuration Table ({} entries):", count);
+    for i in 0..count {
         let entry = &tables[i];
         let guid = &entry.vendor_guid;
 

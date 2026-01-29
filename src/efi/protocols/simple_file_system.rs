@@ -9,7 +9,10 @@ use r_efi::protocols::file as efi_file;
 use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
 
-// Allocator used indirectly through USB mass storage
+use crate::state;
+
+// Re-export FilesystemState for backward compatibility with lib.rs
+pub use crate::state::FilesystemState;
 
 /// Re-export GUIDs
 pub const SIMPLE_FILE_SYSTEM_GUID: Guid = efi_sfs::PROTOCOL_GUID;
@@ -32,48 +35,6 @@ pub const FILE_MODE_CREATE: u64 = efi_file::MODE_CREATE;
 
 /// File attributes
 pub const FILE_DIRECTORY: u64 = efi_file::DIRECTORY;
-
-/// Filesystem state - stores partition info for reading files
-#[derive(Clone, Copy)]
-pub struct FilesystemState {
-    /// First LBA of the partition
-    pub partition_start: u64,
-    /// FAT type (12, 16, or 32)
-    pub fat_type: u8,
-    /// Bytes per sector
-    pub bytes_per_sector: u16,
-    /// Sectors per cluster
-    pub sectors_per_cluster: u8,
-    /// First FAT sector (relative to partition start)
-    pub fat_start: u32,
-    /// Sectors per FAT
-    pub sectors_per_fat: u32,
-    /// First data sector (relative to partition start)
-    pub data_start: u32,
-    /// Root directory cluster (FAT32) or 0 (FAT12/16)
-    pub root_cluster: u32,
-    /// Root directory sector start (FAT12/16 only)
-    pub root_dir_start: u32,
-    /// Root directory sector count (FAT12/16 only)
-    pub root_dir_sectors: u32,
-}
-
-impl FilesystemState {
-    pub const fn empty() -> Self {
-        Self {
-            partition_start: 0,
-            fat_type: 0,
-            bytes_per_sector: 0,
-            sectors_per_cluster: 0,
-            fat_start: 0,
-            sectors_per_fat: 0,
-            data_start: 0,
-            root_cluster: 0,
-            root_dir_start: 0,
-            root_dir_sectors: 0,
-        }
-    }
-}
 
 /// File handle state
 struct FileHandle {
@@ -126,15 +87,11 @@ impl FileHandle {
     }
 }
 
-/// Global filesystem state
-static FS_STATE: Mutex<Option<FilesystemState>> = Mutex::new(None);
-
 /// Global file handle pool
+/// Note: This remains a static because FileHandle contains efi_file::Protocol
+/// with function pointers that reference back to the handles.
 static FILE_HANDLES: Mutex<[FileHandle; MAX_FILE_HANDLES]> =
     Mutex::new([const { FileHandle::empty() }; MAX_FILE_HANDLES]);
-
-/// USB disk read function pointer (set during initialization)
-static USB_READ_FN: Mutex<Option<fn(u64, &mut [u8]) -> Result<(), ()>>> = Mutex::new(None);
 
 /// Simple File System Protocol instance
 static mut SFS_PROTOCOL: efi_sfs::Protocol = efi_sfs::Protocol {
@@ -144,15 +101,16 @@ static mut SFS_PROTOCOL: efi_sfs::Protocol = efi_sfs::Protocol {
 
 /// Initialize the simple file system protocol with filesystem parameters
 pub fn init(
-    state: FilesystemState,
+    fs_state: FilesystemState,
     read_fn: fn(u64, &mut [u8]) -> Result<(), ()>,
 ) -> *mut efi_sfs::Protocol {
-    *FS_STATE.lock() = Some(state);
-    *USB_READ_FN.lock() = Some(read_fn);
+    let efi = state::efi_mut();
+    efi.filesystem = Some(fs_state);
+    efi.disk_read_fn = Some(read_fn);
 
     log::info!(
         "SimpleFileSystem: initialized with partition at LBA {}",
-        state.partition_start
+        fs_state.partition_start
     );
 
     &raw mut SFS_PROTOCOL
@@ -190,7 +148,7 @@ extern "efiapi" fn sfs_open_volume(
     };
 
     // Initialize as root directory
-    let state = match *FS_STATE.lock() {
+    let fs_state = match state::efi().filesystem {
         Some(s) => s,
         None => {
             log::error!("SFS.OpenVolume: filesystem not initialized");
@@ -203,7 +161,7 @@ extern "efiapi" fn sfs_open_volume(
     handles[handle_idx].path_len = 0;
     handles[handle_idx].position = 0;
     handles[handle_idx].file_size = 0;
-    handles[handle_idx].first_cluster = state.root_cluster;
+    handles[handle_idx].first_cluster = fs_state.root_cluster;
     handles[handle_idx].is_directory = true;
 
     // Return pointer to the protocol in this handle
@@ -278,18 +236,19 @@ extern "efiapi" fn file_open(
     log::info!("File.Open: full path = {:?}", full_path_str);
 
     // Look up the file in the filesystem
-    let state = match *FS_STATE.lock() {
+    let efi = state::efi();
+    let fs_state = match efi.filesystem {
         Some(s) => s,
         None => return Status::NOT_READY,
     };
 
-    let read_fn = match *USB_READ_FN.lock() {
+    let read_fn = match efi.disk_read_fn {
         Some(f) => f,
         None => return Status::NOT_READY,
     };
 
     // Find the file
-    match find_file(&state, read_fn, full_path_str) {
+    match find_file(&fs_state, read_fn, full_path_str) {
         Ok((cluster, size, is_dir)) => {
             // Allocate a new file handle
             let mut handles = FILE_HANDLES.lock();
@@ -393,19 +352,26 @@ extern "efiapi" fn file_read(
         return Status::SUCCESS;
     }
 
-    let state = match *FS_STATE.lock() {
+    let efi = state::efi();
+    let fs_state = match efi.filesystem {
         Some(s) => s,
         None => return Status::NOT_READY,
     };
 
-    let read_fn = match *USB_READ_FN.lock() {
+    let read_fn = match efi.disk_read_fn {
         Some(f) => f,
         None => return Status::NOT_READY,
     };
 
     let buf_slice = unsafe { core::slice::from_raw_parts_mut(buffer as *mut u8, bytes_to_read) };
 
-    match read_file_data(&state, read_fn, first_cluster, position as u32, buf_slice) {
+    match read_file_data(
+        &fs_state,
+        read_fn,
+        first_cluster,
+        position as u32,
+        buf_slice,
+    ) {
         Ok(bytes_read) => {
             // Update position
             {
@@ -565,7 +531,7 @@ extern "efiapi" fn file_get_info(
             return Status::INVALID_PARAMETER;
         }
 
-        let state = match *FS_STATE.lock() {
+        let fs_state = match state::efi().filesystem {
             Some(s) => s,
             None => return Status::NOT_READY,
         };
@@ -576,7 +542,7 @@ extern "efiapi" fn file_get_info(
             (*info).read_only = r_efi::efi::Boolean::TRUE; // Read-only
             (*info).volume_size = 0; // Unknown
             (*info).free_space = 0;
-            (*info).block_size = state.bytes_per_sector as u32;
+            (*info).block_size = fs_state.bytes_per_sector as u32;
 
             // Write label as UTF-16 after the struct
             let label_ptr =
@@ -1143,12 +1109,13 @@ fn read_directory(
     buffer: *mut c_void,
     handle_idx: usize,
 ) -> Status {
-    let state = match *FS_STATE.lock() {
+    let efi = state::efi();
+    let fs_state = match efi.filesystem {
         Some(s) => s,
         None => return Status::NOT_READY,
     };
 
-    let read_fn = match *USB_READ_FN.lock() {
+    let read_fn = match efi.disk_read_fn {
         Some(f) => f,
         None => return Status::NOT_READY,
     };
@@ -1162,7 +1129,7 @@ fn read_directory(
     };
 
     // Find the entry at current position
-    let entry_result = get_directory_entry_at_position(&state, read_fn, cluster, position);
+    let entry_result = get_directory_entry_at_position(&fs_state, read_fn, cluster, position);
 
     match entry_result {
         Ok(Some(entry)) => {

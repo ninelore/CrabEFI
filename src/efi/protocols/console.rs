@@ -14,26 +14,17 @@ use crate::drivers::keyboard;
 use crate::drivers::serial;
 use crate::efi::boot_services::KEYBOARD_EVENT_ID;
 use crate::framebuffer_console::{CHAR_HEIGHT, CHAR_WIDTH, VGA_FONT_8X16};
+use crate::state::{self, InputState};
 use core::ffi::c_void;
 use r_efi::efi::{Boolean, Event, Guid, Status};
 use r_efi::protocols::simple_text_input::{InputKey, Protocol as SimpleTextInputProtocol};
 use r_efi::protocols::simple_text_output::{
     Mode as SimpleTextOutputMode, Protocol as SimpleTextOutputProtocol,
 };
-use spin::Mutex;
 
 // ============================================================================
-// EFI Framebuffer Console State
+// EFI Framebuffer Console State (stored in state::ConsoleState)
 // ============================================================================
-
-/// Framebuffer info for EFI console output
-static EFI_FB: Mutex<Option<FramebufferInfo>> = Mutex::new(None);
-
-/// EFI console cursor position (col, row)
-static EFI_CURSOR: Mutex<(u32, u32)> = Mutex::new((0, 0));
-
-/// EFI console dimensions (cols, rows)
-static EFI_DIMS: Mutex<(u32, u32)> = Mutex::new((80, 25));
 
 /// Initialize the EFI console with framebuffer support
 pub fn init_framebuffer(fb: FramebufferInfo) {
@@ -44,9 +35,11 @@ pub fn init_framebuffer(fb: FramebufferInfo) {
     // Use bottom half of screen for EFI console output
     let efi_start_row = rows / 2;
 
-    *EFI_DIMS.lock() = (cols, rows - efi_start_row);
-    *EFI_CURSOR.lock() = (0, efi_start_row);
-    *EFI_FB.lock() = Some(fb);
+    let console = state::console_mut();
+    console.dimensions = (cols, rows - efi_start_row);
+    console.cursor_pos = (0, efi_start_row);
+    console.start_row = efi_start_row;
+    console.efi_framebuffer = Some(fb);
 
     log::info!(
         "EFI console initialized: {}x{} chars, starting at row {}",
@@ -58,16 +51,16 @@ pub fn init_framebuffer(fb: FramebufferInfo) {
 
 /// Write a character to the EFI framebuffer console
 fn fb_put_char(c: char) {
-    let fb_guard = EFI_FB.lock();
-    let Some(ref fb) = *fb_guard else { return };
+    let console = state::console_mut();
+    let Some(ref fb) = console.efi_framebuffer else {
+        return;
+    };
 
-    let dims = *EFI_DIMS.lock();
-    let (cols, _rows) = dims;
+    let (cols, _rows) = console.dimensions;
     let total_rows = fb.y_resolution / CHAR_HEIGHT;
-    let start_row = total_rows / 2; // EFI console starts at bottom half
+    let start_row = console.start_row;
 
-    let mut cursor = EFI_CURSOR.lock();
-    let (mut col, mut row) = *cursor;
+    let (mut col, mut row) = console.cursor_pos;
 
     match c {
         '\n' => {
@@ -96,7 +89,7 @@ fn fb_put_char(c: char) {
         }
     }
 
-    *cursor = (col, row);
+    console.cursor_pos = (col, row);
 }
 
 /// Draw a character at a specific position
@@ -215,37 +208,8 @@ mod scan_codes {
 }
 
 // ============================================================================
-// Input Buffer for Escape Sequence Parsing
+// Input Buffer for Escape Sequence Parsing (stored in state::ConsoleState.input)
 // ============================================================================
-
-/// Maximum size of the escape sequence buffer
-const ESCAPE_BUF_SIZE: usize = 8;
-
-/// Input state for escape sequence parsing
-struct InputState {
-    /// Buffer for escape sequence bytes
-    escape_buf: [u8; ESCAPE_BUF_SIZE],
-    /// Number of bytes in the escape buffer
-    escape_len: usize,
-    /// Whether we're currently in an escape sequence
-    in_escape: bool,
-    /// Queued key to return (scan_code, unicode_char)
-    queued_key: Option<(u16, u16)>,
-}
-
-impl InputState {
-    const fn new() -> Self {
-        InputState {
-            escape_buf: [0; ESCAPE_BUF_SIZE],
-            escape_len: 0,
-            in_escape: false,
-            queued_key: None,
-        }
-    }
-}
-
-/// Global input state protected by a mutex
-static INPUT_STATE: Mutex<InputState> = Mutex::new(InputState::new());
 
 /// Console output mode
 static mut CONSOLE_MODE: SimpleTextOutputMode = SimpleTextOutputMode {
@@ -313,10 +277,11 @@ extern "efiapi" fn text_input_read_key_stroke(
         return Status::INVALID_PARAMETER;
     }
 
-    let mut state = INPUT_STATE.lock();
+    let console = state::console_mut();
+    let input_state = &mut console.input;
 
     // First check if we have a queued key from previous escape sequence parsing
-    if let Some((scan_code, unicode_char)) = state.queued_key.take() {
+    if let Some((scan_code, unicode_char)) = input_state.queued_key.take() {
         unsafe {
             (*key).scan_code = scan_code;
             (*key).unicode_char = unicode_char;
@@ -347,7 +312,7 @@ extern "efiapi" fn text_input_read_key_stroke(
     match serial::try_read() {
         Some(byte) => {
             // Handle escape sequence parsing
-            let (scan_code, unicode_char) = process_serial_byte(&mut state, byte);
+            let (scan_code, unicode_char) = process_serial_byte(input_state, byte);
 
             if scan_code == 0 && unicode_char == 0 {
                 // Still collecting escape sequence, no key ready yet
@@ -370,10 +335,10 @@ extern "efiapi" fn text_input_read_key_stroke(
         }
         None => {
             // Check if we're in the middle of an escape sequence that timed out
-            if state.in_escape && state.escape_len > 0 {
+            if input_state.in_escape && input_state.escape_len > 0 {
                 // Timeout: return what we have as individual characters
                 // This happens when user presses just ESC
-                let result = finalize_escape_sequence(&mut state);
+                let result = finalize_escape_sequence(input_state);
                 if let Some((scan_code, unicode_char)) = result {
                     unsafe {
                         (*key).scan_code = scan_code;
@@ -393,27 +358,29 @@ extern "efiapi" fn text_input_read_key_stroke(
 ///
 /// Returns (scan_code, unicode_char) if a key is ready, or (0, 0) if still collecting
 /// an escape sequence.
-fn process_serial_byte(state: &mut InputState, byte: u8) -> (u16, u16) {
-    if state.in_escape {
+fn process_serial_byte(input_state: &mut InputState, byte: u8) -> (u16, u16) {
+    if input_state.in_escape {
         // We're collecting an escape sequence
-        if state.escape_len < ESCAPE_BUF_SIZE {
-            state.escape_buf[state.escape_len] = byte;
-            state.escape_len += 1;
+        if input_state.escape_len < state::ESCAPE_BUF_SIZE {
+            input_state.escape_buf[input_state.escape_len] = byte;
+            input_state.escape_len += 1;
         }
 
         // Try to match the escape sequence
-        if let Some(key) = match_escape_sequence(&state.escape_buf[..state.escape_len]) {
+        if let Some(key) = match_escape_sequence(&input_state.escape_buf[..input_state.escape_len])
+        {
             // Found a match
-            state.in_escape = false;
-            state.escape_len = 0;
+            input_state.in_escape = false;
+            input_state.escape_len = 0;
             return key;
         }
 
         // Check if the sequence is definitely not going to match
-        if state.escape_len >= 5 || !could_be_escape_sequence(&state.escape_buf[..state.escape_len])
+        if input_state.escape_len >= 5
+            || !could_be_escape_sequence(&input_state.escape_buf[..input_state.escape_len])
         {
             // Give up on this escape sequence, return ESC and queue the rest
-            let result = finalize_escape_sequence(state);
+            let result = finalize_escape_sequence(input_state);
             return result.unwrap_or((0, 0));
         }
 
@@ -424,8 +391,8 @@ fn process_serial_byte(state: &mut InputState, byte: u8) -> (u16, u16) {
     // Not in an escape sequence - check if this starts one
     if byte == 0x1B {
         // Start of escape sequence
-        state.in_escape = true;
-        state.escape_len = 0;
+        input_state.in_escape = true;
+        input_state.escape_len = 0;
         // Return (0, 0) to indicate we need more input
         // But first check if there's more data available immediately
         if !serial::has_input() {
@@ -539,26 +506,26 @@ fn could_be_escape_sequence(buf: &[u8]) -> bool {
 /// Finalize an incomplete escape sequence
 ///
 /// Returns the ESC key and queues remaining bytes to be returned as separate keys
-fn finalize_escape_sequence(state: &mut InputState) -> Option<(u16, u16)> {
+fn finalize_escape_sequence(input_state: &mut InputState) -> Option<(u16, u16)> {
     use scan_codes::*;
 
-    state.in_escape = false;
+    input_state.in_escape = false;
 
-    if state.escape_len == 0 {
+    if input_state.escape_len == 0 {
         // Just ESC with no following characters
-        state.escape_len = 0;
+        input_state.escape_len = 0;
         return Some((SCAN_ESC, 0));
     }
 
     // We have bytes that didn't form a valid sequence
     // Return ESC and queue the first remaining byte
     // (Ideally we'd queue all of them, but for simplicity just queue one)
-    if state.escape_len > 0 {
-        let first_byte = state.escape_buf[0];
-        state.queued_key = Some(convert_byte_to_efi_key(first_byte));
+    if input_state.escape_len > 0 {
+        let first_byte = input_state.escape_buf[0];
+        input_state.queued_key = Some(convert_byte_to_efi_key(first_byte));
     }
 
-    state.escape_len = 0;
+    input_state.escape_len = 0;
     Some((SCAN_ESC, 0))
 }
 
