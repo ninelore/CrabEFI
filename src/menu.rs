@@ -12,13 +12,14 @@
 //! - Future: file browser, EFI variable support
 
 use crate::coreboot;
+use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, UsbDisk};
 use crate::drivers::keyboard;
 use crate::drivers::serial as serial_driver;
 use crate::framebuffer_console::{
-    Color, DEFAULT_BG, DEFAULT_FG, FramebufferConsole, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
+    Color, FramebufferConsole, DEFAULT_BG, DEFAULT_FG, HIGHLIGHT_BG, HIGHLIGHT_FG, TITLE_COLOR,
 };
 use crate::fs::{fat::FatFilesystem, gpt};
-use crate::time::{Timeout, delay_ms};
+use crate::time::{delay_ms, Timeout};
 use core::fmt::Write;
 use heapless::{String, Vec};
 
@@ -217,7 +218,7 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
             }
 
             // Create disk for GPT reading
-            let mut disk = gpt::NvmeDisk::new(controller, nsid);
+            let mut disk = NvmeDisk::new(controller, nsid);
 
             // Read GPT and find partitions
             if let Ok(header) = gpt::read_gpt_header(&mut disk) {
@@ -229,7 +230,7 @@ fn discover_nvme_entries(menu: &mut BootMenu) {
                         if partition.is_esp || is_potential_esp(partition) {
                             // Try to find bootloader on this partition
                             if let Some(controller) = nvme::get_controller(0) {
-                                let mut disk = gpt::NvmeDisk::new(controller, nsid);
+                                let mut disk = NvmeDisk::new(controller, nsid);
                                 if check_bootloader_exists(&mut disk, partition.first_lba) {
                                     let mut name: String<64> = String::new();
                                     let _ = write!(name, "Boot Entry (NVMe ns{})", nsid);
@@ -275,7 +276,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
             }
 
             if let Some(controller) = ahci::get_controller(0) {
-                let mut disk = gpt::AhciDisk::new(controller, port_index);
+                let mut disk = AhciDisk::new(controller, port_index);
 
                 // Read GPT and find partitions
                 if let Ok(header) = gpt::read_gpt_header(&mut disk) {
@@ -287,7 +288,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
                             if partition.is_esp || is_potential_esp(partition) {
                                 // Try to find bootloader on this partition
                                 if let Some(controller) = ahci::get_controller(0) {
-                                    let mut disk = gpt::AhciDisk::new(controller, port_index);
+                                    let mut disk = AhciDisk::new(controller, port_index);
                                     if check_bootloader_exists(&mut disk, partition.first_lba) {
                                         let mut name: String<64> = String::new();
                                         let _ =
@@ -322,7 +323,7 @@ fn discover_ahci_entries(menu: &mut BootMenu) {
 
 /// Discover boot entries from USB devices (all controller types)
 fn discover_usb_entries(menu: &mut BootMenu) {
-    use crate::drivers::usb::{self, UsbMassStorage, mass_storage};
+    use crate::drivers::usb::{self, mass_storage, UsbMassStorage};
 
     // Check if we have any mass storage on any controller
     if let Some((controller_id, device_addr)) = usb::find_mass_storage() {
@@ -366,7 +367,7 @@ fn discover_usb_entries(menu: &mut BootMenu) {
         // Now read partitions using the stored device
         usb::with_controller(controller_id, |controller| {
             if let Some(usb_device) = mass_storage::get_global_device() {
-                let mut disk = gpt::UsbDisk::new(usb_device, controller);
+                let mut disk = UsbDisk::new(usb_device, controller);
 
                 // Read GPT and find partitions
                 if let Ok(header) = gpt::read_gpt_header(&mut disk) {
@@ -379,7 +380,7 @@ fn discover_usb_entries(menu: &mut BootMenu) {
                                 // We need to create a new disk reference for checking bootloader
                                 // This is a bit awkward due to borrowing rules
                                 if let Some(usb_device2) = mass_storage::get_global_device() {
-                                    let mut disk2 = gpt::UsbDisk::new(usb_device2, controller);
+                                    let mut disk2 = UsbDisk::new(usb_device2, controller);
                                     if check_bootloader_exists(&mut disk2, partition.first_lba) {
                                         let mut name: String<64> = String::new();
                                         let controller_type = controller.controller_type();
@@ -421,7 +422,7 @@ fn is_potential_esp(partition: &gpt::Partition) -> bool {
 }
 
 /// Check if a bootloader exists on the given partition
-fn check_bootloader_exists<R: gpt::SectorRead>(disk: &mut R, partition_start: u64) -> bool {
+fn check_bootloader_exists<D: BlockDevice>(disk: &mut D, partition_start: u64) -> bool {
     match FatFilesystem::new(disk, partition_start) {
         Ok(mut fat) => match fat.file_size("EFI\\BOOT\\BOOTX64.EFI") {
             Ok(size) => size > 0,

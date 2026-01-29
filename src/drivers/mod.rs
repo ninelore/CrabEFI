@@ -3,6 +3,7 @@
 //! This module contains drivers for hardware devices needed to boot.
 
 pub mod ahci;
+pub mod block;
 pub mod keyboard;
 pub mod nvme;
 pub mod pci;

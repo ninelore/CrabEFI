@@ -3,7 +3,7 @@
 //! This module provides read support for FAT12/16/32 filesystems.
 //! Used to read files from the EFI System Partition.
 
-use super::gpt::SectorRead;
+use crate::drivers::block::BlockDevice;
 
 /// Sector size (usually 512 bytes)
 pub const SECTOR_SIZE: usize = 512;
@@ -221,9 +221,9 @@ pub enum FatError {
 }
 
 /// FAT filesystem instance
-pub struct FatFilesystem<'a, R: SectorRead> {
-    /// Block device reader
-    reader: &'a mut R,
+pub struct FatFilesystem<'a, D: BlockDevice> {
+    /// Block device
+    device: &'a mut D,
     /// First sector of partition
     partition_start: u64,
     /// FAT type
@@ -250,14 +250,14 @@ pub struct FatFilesystem<'a, R: SectorRead> {
     data_clusters: u32,
 }
 
-impl<'a, R: SectorRead> FatFilesystem<'a, R> {
+impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
     /// Create a new FAT filesystem instance
-    pub fn new(reader: &'a mut R, partition_start: u64) -> Result<Self, FatError> {
+    pub fn new(device: &'a mut D, partition_start: u64) -> Result<Self, FatError> {
         let mut buffer = [0u8; SECTOR_SIZE];
 
         // Read the boot sector
-        reader
-            .read_sector(partition_start, &mut buffer)
+        device
+            .read_block(partition_start, &mut buffer)
             .map_err(|_| FatError::ReadError)?;
 
         // Parse BPB
@@ -368,7 +368,7 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
         );
 
         Ok(Self {
-            reader,
+            device,
             partition_start,
             fat_type,
             bytes_per_sector,
@@ -411,8 +411,8 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
             }
         };
 
-        self.reader
-            .read_sector(self.partition_start + sector_offset as u64, &mut buffer)
+        self.device
+            .read_block(self.partition_start + sector_offset as u64, &mut buffer)
             .map_err(|_| FatError::ReadError)?;
 
         let next = match self.fat_type {
@@ -423,8 +423,8 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
                 } else {
                     // Entry spans sectors - need to read next sector
                     let low = buffer[fat_offset as usize] as u16;
-                    self.reader
-                        .read_sector(
+                    self.device
+                        .read_block(
                             self.partition_start + (sector_offset + 1) as u64,
                             &mut buffer,
                         )
@@ -493,8 +493,8 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
 
         (0..self.sectors_per_cluster).try_for_each(|i| {
             let offset = i as usize * bytes_per_sector;
-            self.reader
-                .read_sector(
+            self.device
+                .read_block(
                     start_sector + i as u64,
                     &mut buffer[offset..offset + bytes_per_sector],
                 )
@@ -546,8 +546,8 @@ impl<'a, R: SectorRead> FatFilesystem<'a, R> {
             // FAT12/16 root directory (fixed location)
             for sector_idx in 0..self.root_dir_sectors {
                 let sector = self.partition_start + (self.root_dir_start + sector_idx) as u64;
-                self.reader
-                    .read_sector(sector, &mut buffer[..self.bytes_per_sector as usize])
+                self.device
+                    .read_block(sector, &mut buffer[..self.bytes_per_sector as usize])
                     .map_err(|_| FatError::ReadError)?;
 
                 for i in 0..entries_per_sector {

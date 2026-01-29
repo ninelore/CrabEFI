@@ -24,6 +24,7 @@ pub mod pe;
 pub mod state;
 pub mod time;
 
+use crate::drivers::block::{AhciDisk, BlockDevice, NvmeDisk, UsbDisk};
 use core::panic::PanicInfo;
 
 /// Global panic handler
@@ -262,7 +263,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                 let pci_addr = controller.pci_address();
 
                 // Create disk for partition installation
-                let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+                let mut disk = NvmeDisk::new(controller, nsid);
 
                 // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
                 let _ = install_block_io_for_nvme_disk(
@@ -277,7 +278,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 
                 // Re-create disk and boot from ESP
                 if let Some(controller) = drivers::nvme::get_controller(controller_id) {
-                    let mut disk = fs::gpt::NvmeDisk::new(controller, nsid);
+                    let mut disk = NvmeDisk::new(controller, nsid);
                     if try_boot_from_esp_nvme(
                         &mut disk,
                         &entry.partition,
@@ -334,7 +335,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                 let pci_addr = controller.pci_address();
 
                 // Create disk for partition installation
-                let mut disk = fs::gpt::AhciDisk::new(controller, port);
+                let mut disk = AhciDisk::new(controller, port);
 
                 // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
                 let _ = install_block_io_for_ahci_disk(
@@ -349,7 +350,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 
                 // Re-create disk and boot from ESP
                 if let Some(controller) = drivers::ahci::get_controller(controller_id) {
-                    let mut disk = fs::gpt::AhciDisk::new(controller, port);
+                    let mut disk = AhciDisk::new(controller, port);
                     if try_boot_from_esp_ahci(
                         &mut disk,
                         &entry.partition,
@@ -404,7 +405,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 
                 // Create disk for partition installation
                 if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = fs::gpt::UsbDisk::new(usb_device, controller);
+                    let mut disk = UsbDisk::new(usb_device, controller);
 
                     // Install BlockIO for ALL partitions (GRUB needs this to enumerate)
                     let _ = install_block_io_for_disk(
@@ -422,7 +423,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
                 // (previous borrows have ended)
                 let controller = unsafe { &mut *controller_ptr };
                 if let Some(usb_device) = drivers::usb::mass_storage::get_global_device() {
-                    let mut disk = fs::gpt::UsbDisk::new(usb_device, controller);
+                    let mut disk = UsbDisk::new(usb_device, controller);
                     if try_boot_from_esp_usb(
                         &mut disk,
                         &entry.partition,
@@ -452,7 +453,7 @@ fn boot_selected_entry(entry: &menu::BootEntry) {
 /// * `pci_device` - PCI device number of the controller (for USB device path)
 /// * `pci_function` - PCI function number
 /// * `usb_port` - USB port number (0 for non-USB devices)
-fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
+fn install_block_io_for_disk<R: BlockDevice>(
     disk: &mut R,
     storage_id: u32,
     block_size: u32,
@@ -632,7 +633,7 @@ fn install_block_io_for_disk<R: fs::gpt::SectorRead>(
 /// * `pci_device` - PCI device number of the NVMe controller
 /// * `pci_function` - PCI function number
 /// * `namespace_id` - NVMe namespace ID
-fn install_block_io_for_nvme_disk<R: fs::gpt::SectorRead>(
+fn install_block_io_for_nvme_disk<R: BlockDevice>(
     disk: &mut R,
     storage_id: u32,
     block_size: u32,
@@ -811,7 +812,7 @@ fn install_block_io_for_nvme_disk<R: fs::gpt::SectorRead>(
 /// * `pci_device` - PCI device number of the AHCI controller
 /// * `pci_function` - PCI function number
 /// * `port` - AHCI port number
-fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
+fn install_block_io_for_ahci_disk<R: BlockDevice>(
     disk: &mut R,
     storage_id: u32,
     block_size: u32,
@@ -987,7 +988,7 @@ fn install_block_io_for_ahci_disk<R: fs::gpt::SectorRead>(
 /// * `pci_device` - PCI device number of USB controller
 /// * `pci_function` - PCI function number
 /// * `usb_port` - USB port number
-fn try_boot_from_esp_usb<D: fs::gpt::SectorRead>(
+fn try_boot_from_esp_usb<D: BlockDevice>(
     disk: &mut D,
     esp: &fs::gpt::Partition,
     partition_num: u32,
@@ -1166,7 +1167,7 @@ fn check_system_table_integrity(label: &str) {
 /// * `pci_function` - PCI function number
 /// * `namespace_id` - NVMe namespace ID
 fn try_boot_from_esp_nvme(
-    disk: &mut fs::gpt::NvmeDisk,
+    disk: &mut NvmeDisk,
     esp: &fs::gpt::Partition,
     partition_num: u32,
     pci_device: u8,
@@ -1329,7 +1330,7 @@ fn try_boot_from_esp_nvme(
 /// * `pci_function` - PCI function number
 /// * `port` - AHCI port number
 fn try_boot_from_esp_ahci(
-    disk: &mut fs::gpt::AhciDisk,
+    disk: &mut AhciDisk,
     esp: &fs::gpt::Partition,
     partition_num: u32,
     pci_device: u8,
@@ -1482,7 +1483,7 @@ fn try_boot_from_esp_ahci(
 ///
 /// This version uses the provided disk directly instead of global_read_sector,
 /// which avoids deadlocks when called from within a with_controller closure.
-fn extract_fat_state<R: fs::gpt::SectorRead>(
+fn extract_fat_state<R: BlockDevice>(
     disk: &mut R,
     partition_start: u64,
 ) -> efi::protocols::simple_file_system::FilesystemState {
@@ -1491,7 +1492,7 @@ fn extract_fat_state<R: fs::gpt::SectorRead>(
 
     // Read boot sector directly from the disk
     let mut buffer = [0u8; SECTOR_SIZE];
-    if let Err(_) = disk.read_sector(partition_start, &mut buffer) {
+    if let Err(_) = disk.read_block(partition_start, &mut buffer) {
         log::error!("Failed to read boot sector for filesystem state");
         return FilesystemState::empty();
     }
@@ -1609,15 +1610,15 @@ fn parse_fat_bpb(
 }
 
 /// Load and execute an EFI bootloader from the filesystem
-fn load_and_execute_bootloader<R: fs::gpt::SectorRead>(
+fn load_and_execute_bootloader<R: BlockDevice>(
     fat: &mut fs::fat::FatFilesystem<R>,
     path: &str,
     file_size: u32,
     device_handle: r_efi::efi::Handle,
 ) -> Result<(), r_efi::efi::Status> {
-    use efi::allocator::{MemoryType, allocate_pool, free_pool};
+    use efi::allocator::{allocate_pool, free_pool, MemoryType};
     use efi::boot_services;
-    use efi::protocols::loaded_image::{LOADED_IMAGE_PROTOCOL_GUID, create_loaded_image_protocol};
+    use efi::protocols::loaded_image::{create_loaded_image_protocol, LOADED_IMAGE_PROTOCOL_GUID};
     use r_efi::efi::Status;
 
     log::info!("Loading bootloader: {} ({} bytes)", path, file_size);

@@ -3,11 +3,7 @@
 //! This module provides parsing of GPT partitioned disks to find the EFI
 //! System Partition (ESP).
 
-use crate::drivers::ahci::AhciController;
-use crate::drivers::nvme::NvmeController;
-
-/// Sector size (standard for most disks)
-pub const SECTOR_SIZE: usize = 512;
+use crate::drivers::block::{BlockDevice, BlockError, SECTOR_SIZE};
 
 /// GPT header signature "EFI PART"
 const GPT_SIGNATURE: u64 = 0x5452415020494645;
@@ -186,44 +182,23 @@ pub enum GptError {
     BufferTooSmall,
 }
 
-/// Sector read trait for abstracting block devices
-pub trait SectorRead {
-    /// Read a single sector
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError>;
-}
-
-/// Wrapper around NVMe controller for SectorRead trait
-pub struct NvmeDisk<'a> {
-    controller: &'a mut NvmeController,
-    nsid: u32,
-}
-
-impl<'a> NvmeDisk<'a> {
-    pub fn new(controller: &'a mut NvmeController, nsid: u32) -> Self {
-        Self { controller, nsid }
-    }
-}
-
-impl<'a> SectorRead for NvmeDisk<'a> {
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
-        if buffer.len() < SECTOR_SIZE {
-            return Err(GptError::BufferTooSmall);
+impl From<BlockError> for GptError {
+    fn from(e: BlockError) -> Self {
+        match e {
+            BlockError::InvalidParameter => GptError::BufferTooSmall,
+            _ => GptError::ReadError,
         }
-
-        self.controller
-            .read_sector(self.nsid, lba, buffer)
-            .map_err(|_| GptError::ReadError)
     }
 }
 
 /// Read and parse the GPT header
-pub fn read_gpt_header<R: SectorRead>(reader: &mut R) -> Result<GptHeader, GptError> {
+pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptError> {
     let mut buffer = [0u8; SECTOR_SIZE];
 
     log::debug!("Reading GPT header from LBA 1...");
 
     // GPT header is at LBA 1 (sector 1)
-    reader.read_sector(1, &mut buffer)?;
+    device.read_block(1, &mut buffer)?;
 
     // Parse header (copy to avoid alignment issues with packed struct)
     let header = unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const GptHeader) };
@@ -250,8 +225,8 @@ pub fn read_gpt_header<R: SectorRead>(reader: &mut R) -> Result<GptHeader, GptEr
 }
 
 /// Read partition entries from GPT
-pub fn read_partitions<R: SectorRead>(
-    reader: &mut R,
+pub fn read_partitions<D: BlockDevice>(
+    device: &mut D,
     header: &GptHeader,
 ) -> Result<heapless::Vec<Partition, 16>, GptError> {
     let mut partitions = heapless::Vec::new();
@@ -269,7 +244,7 @@ pub fn read_partitions<R: SectorRead>(
 
         // Try to read the sector, but don't fail if we've already found partitions
         // and encounter a read error (some ISOs have truncated partition tables)
-        if let Err(e) = reader.read_sector(lba, &mut buffer) {
+        if let Err(e) = device.read_block(lba, &mut buffer) {
             if !partitions.is_empty() {
                 log::debug!(
                     "Stopping partition scan at LBA {} (read error after finding {} partitions): {:?}",
@@ -279,7 +254,7 @@ pub fn read_partitions<R: SectorRead>(
                 );
                 break;
             }
-            return Err(e);
+            return Err(e.into());
         }
 
         for i in 0..entries_per_sector {
@@ -341,9 +316,9 @@ pub fn read_partitions<R: SectorRead>(
 }
 
 /// Find the EFI System Partition
-pub fn find_esp<R: SectorRead>(reader: &mut R) -> Result<Partition, GptError> {
-    let header = read_gpt_header(reader)?;
-    let partitions = read_partitions(reader, &header)?;
+pub fn find_esp<D: BlockDevice>(device: &mut D) -> Result<Partition, GptError> {
+    let header = read_gpt_header(device)?;
+    let partitions = read_partitions(device, &header)?;
 
     partitions
         .into_iter()
@@ -358,89 +333,4 @@ pub fn find_esp<R: SectorRead>(reader: &mut R) -> Result<Partition, GptError> {
             partition
         })
         .ok_or(GptError::NoEsp)
-}
-
-/// Find ESP on an NVMe controller
-pub fn find_esp_on_nvme(controller: &mut NvmeController) -> Result<Partition, GptError> {
-    let nsid = controller
-        .default_namespace()
-        .map(|ns| ns.nsid)
-        .ok_or(GptError::ReadError)?;
-
-    let mut disk = NvmeDisk::new(controller, nsid);
-    find_esp(&mut disk)
-}
-
-/// Wrapper around AHCI controller for SectorRead trait
-pub struct AhciDisk<'a> {
-    controller: &'a mut AhciController,
-    port_index: usize,
-}
-
-impl<'a> AhciDisk<'a> {
-    pub fn new(controller: &'a mut AhciController, port_index: usize) -> Self {
-        Self {
-            controller,
-            port_index,
-        }
-    }
-}
-
-impl<'a> SectorRead for AhciDisk<'a> {
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
-        if buffer.len() < SECTOR_SIZE {
-            return Err(GptError::BufferTooSmall);
-        }
-
-        self.controller
-            .read_sectors(self.port_index, lba, 1, buffer.as_mut_ptr())
-            .map_err(|_| GptError::ReadError)
-    }
-}
-
-/// Find ESP on an AHCI controller
-pub fn find_esp_on_ahci(
-    controller: &mut AhciController,
-    port_index: usize,
-) -> Result<Partition, GptError> {
-    let mut disk = AhciDisk::new(controller, port_index);
-    find_esp(&mut disk)
-}
-
-use crate::drivers::usb::{UsbController, UsbMassStorage};
-
-/// Wrapper around USB mass storage for SectorRead trait
-pub struct UsbDisk<'a> {
-    device: &'a mut UsbMassStorage,
-    controller: &'a mut dyn UsbController,
-}
-
-impl<'a> UsbDisk<'a> {
-    pub fn new(device: &'a mut UsbMassStorage, controller: &'a mut dyn UsbController) -> Self {
-        Self { device, controller }
-    }
-}
-
-impl<'a> SectorRead for UsbDisk<'a> {
-    fn read_sector(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), GptError> {
-        if buffer.len() < SECTOR_SIZE {
-            return Err(GptError::BufferTooSmall);
-        }
-
-        self.device
-            .read_sectors_generic(self.controller, lba, 1, buffer)
-            .map_err(|e| {
-                log::debug!("USB read_sector failed at LBA {}: {:?}", lba, e);
-                GptError::ReadError
-            })
-    }
-}
-
-/// Find ESP on a USB mass storage device
-pub fn find_esp_on_usb(
-    device: &mut UsbMassStorage,
-    controller: &mut dyn UsbController,
-) -> Result<Partition, GptError> {
-    let mut disk = UsbDisk::new(device, controller);
-    find_esp(&mut disk)
 }
