@@ -540,11 +540,17 @@ pub fn store_global_device_with_controller_ptr(
             core::ptr::write(device_ptr, device);
         }
 
+        // Get controller type for logging before storing
+        let controller_type = unsafe { (*controller_ptr).controller_type() };
+
         *GLOBAL_USB_STATE.lock() = Some(GlobalUsbState {
             device_ptr,
             controller_ptr,
         });
-        log::info!("USB mass storage device stored globally");
+        log::info!(
+            "USB mass storage device stored globally (controller: {})",
+            controller_type
+        );
         true
     } else {
         log::error!("Failed to allocate memory for global USB device");
@@ -584,9 +590,14 @@ pub fn global_read_sector(lba: u64, buffer: &mut [u8]) -> Result<(), ()> {
     let device = unsafe { &mut *device_ptr };
     let controller = unsafe { &mut *controller_ptr };
 
-    device
-        .read_sectors_generic(controller, lba, 1, buffer)
-        .map_err(|e| {
-            log::error!("USB mass storage: read failed at LBA {}: {:?}", lba, e);
-        })
+    let result = device.read_sectors_generic(controller, lba, 1, buffer);
+    if let Err(ref e) = result {
+        log::error!(
+            "USB mass storage: read failed at LBA {} via {}: {:?}",
+            lba,
+            controller.controller_type(),
+            e
+        );
+    }
+    result.map_err(|_| ())
 }
