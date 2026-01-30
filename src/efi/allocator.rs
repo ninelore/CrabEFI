@@ -15,7 +15,8 @@ use heapless::Vec;
 use r_efi::efi;
 
 /// Maximum number of memory map entries we can track
-const MAX_MEMORY_ENTRIES: usize = 256;
+/// Windows bootloader can create many small allocations, so we need a large buffer
+const MAX_MEMORY_ENTRIES: usize = 512;
 
 /// Page size (4KB)
 pub const PAGE_SIZE: u64 = 4096;
@@ -475,14 +476,21 @@ impl MemoryAllocator {
                     return efi::Status::INVALID_PARAMETER;
                 }
 
-                // Check if the region is available
+                // Check if the region is available (ConventionalMemory)
                 if self.is_region_free(addr, size) {
                     match self.carve_out(addr, num_pages, memory_type) {
                         Ok(()) => efi::Status::SUCCESS,
                         Err(status) => status,
                     }
                 } else {
-                    efi::Status::NOT_FOUND
+                    // Check if requested region is within an existing LoaderCode/LoaderData region
+                    // The bootloader may be trying to "sub-allocate" within its own image space
+                    // This can happen when SizeOfImage is larger than actually used sections
+                    if self.try_reallocate_loader_region(addr, num_pages, memory_type) {
+                        efi::Status::SUCCESS
+                    } else {
+                        efi::Status::NOT_FOUND
+                    }
                 }
             }
         }
@@ -676,11 +684,154 @@ impl MemoryAllocator {
             None => return false,
         };
 
-        self.entries.iter().any(|entry| {
+        let found = self.entries.iter().any(|entry| {
             entry.get_memory_type() == Some(MemoryType::ConventionalMemory)
                 && entry.physical_start <= start
                 && entry.end() >= end
-        })
+        });
+
+        if !found {
+            // Debug: find what's at this address
+            let containing = self.entries.iter().find(|entry| {
+                entry.physical_start <= start && entry.end() > start
+            });
+            if let Some(entry) = containing {
+                log::debug!(
+                    "is_region_free({:#x}, {:#x}): found {:?} at {:#x}-{:#x} (need end >= {:#x})",
+                    start,
+                    size,
+                    entry.get_memory_type(),
+                    entry.physical_start,
+                    entry.end(),
+                    end
+                );
+            } else {
+                log::debug!(
+                    "is_region_free({:#x}, {:#x}): no entry contains this address",
+                    start,
+                    size
+                );
+                // Dump nearby entries to understand the gap
+                for entry in self.entries.iter() {
+                    if entry.end() >= start.saturating_sub(0x100000)
+                        && entry.physical_start <= start.saturating_add(0x100000)
+                    {
+                        log::debug!(
+                            "  nearby: {:#x}-{:#x} {:?}",
+                            entry.physical_start,
+                            entry.end(),
+                            entry.get_memory_type()
+                        );
+                    }
+                }
+            }
+        }
+
+        found
+    }
+
+    /// Try to reallocate within an existing LoaderCode/LoaderData region
+    ///
+    /// Some bootloaders (like Windows) allocate a large SizeOfImage but only use
+    /// part of it, then try to allocate more pages within that same region.
+    /// This function handles that case by splitting the existing region.
+    fn try_reallocate_loader_region(
+        &mut self,
+        addr: u64,
+        num_pages: u64,
+        memory_type: MemoryType,
+    ) -> bool {
+        let size = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(s) => s,
+            None => return false,
+        };
+        let end = match addr.checked_add(size) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        // Find entry containing this address that is LoaderCode or LoaderData
+        let found_idx = self.entries.iter().position(|entry| {
+            let is_loader = matches!(
+                entry.get_memory_type(),
+                Some(MemoryType::LoaderCode) | Some(MemoryType::LoaderData)
+            );
+            is_loader && entry.physical_start <= addr && entry.end() >= end
+        });
+
+        let idx = match found_idx {
+            Some(i) => i,
+            None => return false,
+        };
+
+        let entry = self.entries[idx];
+        let original_type = entry.get_memory_type().unwrap();
+
+        // If the requested type is the same as the existing type, this is effectively
+        // a no-op - the memory is already allocated as the requested type.
+        // Some bootloaders expect this to succeed.
+        if original_type == memory_type {
+            log::debug!(
+                "AllocateAddress: region {:#x}-{:#x} already {:?}, treating as success",
+                addr,
+                end,
+                memory_type
+            );
+            // Don't modify the memory map or map_key - nothing actually changed
+            return true;
+        }
+
+        // Different type requested - we need to split the region
+        log::debug!(
+            "AllocateAddress: splitting {:?} region at {:#x} for {:?}",
+            original_type,
+            addr,
+            memory_type
+        );
+
+        // Calculate how many new entries we need
+        let need_before = entry.physical_start < addr;
+        let need_after = entry.end() > end;
+        let new_entries_needed = 1 + need_before as usize + need_after as usize;
+
+        // Check if we have space BEFORE modifying
+        let entries_after_op = self.entries.len() + new_entries_needed - 1;
+        if entries_after_op > MAX_MEMORY_ENTRIES {
+            self.merge_entries();
+            if self.entries.len() + new_entries_needed - 1 > MAX_MEMORY_ENTRIES {
+                log::warn!("Memory map full, cannot split loader region");
+                return false;
+            }
+        }
+
+        let attribute = entry.attribute;
+
+        // Remove the old entry
+        self.entries.remove(idx);
+
+        // Add region before the new allocation (keep original type)
+        if need_before {
+            let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
+            let before =
+                MemoryDescriptor::new(original_type, entry.physical_start, before_pages, attribute);
+            let _ = self.entries.push(before);
+        }
+
+        // Add the newly allocated region
+        let new_region = MemoryDescriptor::new(memory_type, addr, num_pages, attribute);
+        let _ = self.entries.push(new_region);
+
+        // Add region after the new allocation (keep original type)
+        if need_after {
+            let after_pages = (entry.end() - end) / PAGE_SIZE;
+            let after = MemoryDescriptor::new(original_type, end, after_pages, attribute);
+            let _ = self.entries.push(after);
+        }
+
+        self.map_key += 1;
+        self.sort_entries();
+        self.merge_entries(); // Consolidate to reduce fragmentation
+        true
     }
 
     /// Carve out a region from conventional memory and mark it as a new type
@@ -708,7 +859,28 @@ impl MemoryAllocator {
         let idx = found_idx.ok_or(efi::Status::NOT_FOUND)?;
         let entry = self.entries[idx];
 
-        // Remove the old entry
+        // Calculate how many new entries we need (1-3: before?, carved, after?)
+        let need_before = entry.physical_start < addr;
+        let need_after = entry.end() > end;
+        let new_entries_needed = 1 + need_before as usize + need_after as usize;
+
+        // Check if we have space BEFORE modifying anything
+        // We remove 1 entry and add new_entries_needed, so net change is new_entries_needed - 1
+        let entries_after_op = self.entries.len() + new_entries_needed - 1;
+        if entries_after_op > MAX_MEMORY_ENTRIES {
+            // Try to make room by merging first
+            self.merge_entries();
+            let entries_after_merge = self.entries.len() + new_entries_needed - 1;
+            if entries_after_merge > MAX_MEMORY_ENTRIES {
+                log::warn!(
+                    "Memory map full ({} entries), cannot carve out region",
+                    self.entries.len()
+                );
+                return Err(efi::Status::OUT_OF_RESOURCES);
+            }
+        }
+
+        // Now safe to remove the old entry
         self.entries.remove(idx);
 
         // Add up to 3 new entries: before, carved, after
@@ -727,37 +899,36 @@ impl MemoryAllocator {
         }
 
         // Region before the carved out portion
-        if entry.physical_start < addr {
+        if need_before {
             let before_pages = (addr - entry.physical_start) / PAGE_SIZE;
             let before = MemoryDescriptor::new(
                 MemoryType::ConventionalMemory,
                 entry.physical_start,
                 before_pages,
-                attribute,
+                entry.attribute, // Use original attribute for ConventionalMemory
             );
-            if self.entries.push(before).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
+            let _ = self.entries.push(before); // We pre-checked space
         }
 
         // The carved out region
         let carved = MemoryDescriptor::new(memory_type, addr, num_pages, attribute);
-        if self.entries.push(carved).is_err() {
-            return Err(efi::Status::OUT_OF_RESOURCES);
-        }
+        let _ = self.entries.push(carved); // We pre-checked space
 
         // Region after the carved out portion
-        if entry.end() > end {
+        if need_after {
             let after_pages = (entry.end() - end) / PAGE_SIZE;
-            let after =
-                MemoryDescriptor::new(MemoryType::ConventionalMemory, end, after_pages, attribute);
-            if self.entries.push(after).is_err() {
-                return Err(efi::Status::OUT_OF_RESOURCES);
-            }
+            let after = MemoryDescriptor::new(
+                MemoryType::ConventionalMemory,
+                end,
+                after_pages,
+                entry.attribute, // Use original attribute for ConventionalMemory
+            );
+            let _ = self.entries.push(after); // We pre-checked space
         }
 
         self.map_key += 1;
         self.sort_entries();
+        self.merge_entries(); // Always merge after carving to reduce fragmentation
 
         Ok(())
     }
@@ -767,6 +938,38 @@ impl MemoryAllocator {
         self.entries
             .as_mut_slice()
             .sort_unstable_by_key(|entry| entry.physical_start);
+    }
+
+    /// Debug: dump memory map to log
+    #[allow(dead_code)]
+    pub fn dump_memory_map(&self) {
+        log::info!("Memory map ({} entries):", self.entries.len());
+        for (i, entry) in self.entries.iter().enumerate() {
+            log::info!(
+                "  [{}] {:#010x}-{:#010x} {:?}",
+                i,
+                entry.physical_start,
+                entry.end(),
+                entry.get_memory_type()
+            );
+        }
+    }
+
+    /// Check for gaps in the memory map and report them
+    #[allow(dead_code)]
+    pub fn check_for_gaps(&self) {
+        for i in 0..self.entries.len().saturating_sub(1) {
+            let current_end = self.entries[i].end();
+            let next_start = self.entries[i + 1].physical_start;
+            if current_end < next_start {
+                log::warn!(
+                    "GAP in memory map: {:#x}-{:#x} ({} bytes)",
+                    current_end,
+                    next_start,
+                    next_start - current_end
+                );
+            }
+        }
     }
 
     /// Merge adjacent entries of the same type and attributes

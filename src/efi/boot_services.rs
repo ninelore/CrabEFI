@@ -189,7 +189,7 @@ extern "efiapi" fn allocate_pages(
         unsafe { *memory = addr };
         log::debug!("  -> allocated at {:#x}", addr);
     } else {
-        log::debug!("  -> failed: {:?}", status);
+        log::warn!("  -> failed: {:?}", status);
     }
 
     status
