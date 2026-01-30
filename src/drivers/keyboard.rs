@@ -128,6 +128,21 @@ mod response {
     pub const ECHO: u8 = 0xEE;
 }
 
+/// Bit masks for raw byte manipulation
+///
+/// Note: tock-registers Field::mask is unshifted, so we define these
+/// pre-shifted constants for use with raw byte operations.
+mod masks {
+    // Status register bits
+    pub const OUTPUT_FULL: u8 = 1 << 0;
+    pub const AUX_DATA: u8 = 1 << 5;
+
+    // Config byte bits
+    pub const KB_INT: u8 = 1 << 0;
+    pub const AUX_INT: u8 = 1 << 1;
+    pub const TRANSLATION: u8 = 1 << 6;
+}
+
 // ============================================================================
 // PS/2 Port Registers
 // ============================================================================
@@ -259,7 +274,7 @@ impl KeyboardState {
     fn has_data(&self) -> bool {
         let status = self.ports.status_cmd.get();
         // Check output buffer full and not from auxiliary device (mouse)
-        (status & Status::OUTPUT_FULL.mask) != 0 && (status & Status::AUX_DATA.mask) == 0
+        (status & masks::OUTPUT_FULL) != 0 && (status & masks::AUX_DATA) == 0
     }
 }
 
@@ -345,9 +360,9 @@ pub fn init() {
 
     // Enable translation (scancode set 2 -> set 1) and disable interrupts
     // We poll the keyboard instead of using interrupts
-    config_byte |= Config::TRANSLATION.mask;
-    config_byte &= !Config::KB_INT.mask;
-    config_byte &= !Config::AUX_INT.mask;
+    config_byte |= masks::TRANSLATION;
+    config_byte &= !masks::KB_INT;
+    config_byte &= !masks::AUX_INT;
 
     if !kb.send_controller_cmd(cmd::WRITE_CONFIG) {
         log::warn!("Failed to write PS/2 controller config");
@@ -417,7 +432,7 @@ pub fn cleanup() {
 
     // Re-enable keyboard interrupt (IRQ1) for the OS
     // Keep translation enabled as most OSes expect scancode set 1
-    config_byte |= Config::KB_INT.mask;
+    config_byte |= masks::KB_INT;
 
     if !kb.send_controller_cmd(cmd::WRITE_CONFIG) {
         log::warn!("Failed to write PS/2 controller config during cleanup");
@@ -458,11 +473,11 @@ pub fn try_read_key() -> Option<(u16, u16)> {
     let status = kb.ports.status_cmd.get();
 
     // Check if keyboard data is available (not mouse data)
-    if (status & Status::OUTPUT_FULL.mask) == 0 {
+    if (status & masks::OUTPUT_FULL) == 0 {
         return None;
     }
 
-    if (status & Status::AUX_DATA.mask) != 0 {
+    if (status & masks::AUX_DATA) != 0 {
         // Mouse data, discard it
         let _ = kb.ports.data.get();
         return None;
