@@ -44,6 +44,13 @@ pub fn init(cb_info: &CorebootInfo) {
         log::warn!("No ACPI RSDP from coreboot - Linux may not have ACPI support!");
     }
 
+    // Install SMBIOS tables if available
+    if let Some(smbios) = cb_info.smbios {
+        system_table::install_smbios_tables(smbios);
+    } else {
+        log::debug!("No SMBIOS tables from coreboot");
+    }
+
     // Create console handle - this will also have GOP installed on it
     let console_handle = init_console();
 

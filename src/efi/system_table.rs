@@ -57,6 +57,70 @@ pub const SMBIOS3_TABLE_GUID: Guid = Guid::from_fields(
     &[0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94],
 );
 
+/// SMBIOS 2.1 Entry Point structure (32-bit)
+///
+/// Reference: SMBIOS Reference Specification, Chapter 5.2.1
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Smbios21Entry {
+    /// Anchor string "_SM_"
+    anchor: [u8; 4],
+    /// Checksum of entry point structure
+    checksum: u8,
+    /// Length of entry point structure (0x1F for 2.1)
+    length: u8,
+    /// SMBIOS major version
+    major_version: u8,
+    /// SMBIOS minor version
+    minor_version: u8,
+    /// Maximum structure size
+    max_struct_size: u16,
+    /// Entry point revision
+    entry_point_rev: u8,
+    /// Formatted area (reserved)
+    formatted_area: [u8; 5],
+    /// Intermediate anchor "_DMI_"
+    intermediate_anchor: [u8; 5],
+    /// Intermediate checksum
+    intermediate_checksum: u8,
+    /// Total length of structure table
+    struct_table_length: u16,
+    /// 32-bit physical address of structure table
+    struct_table_address: u32,
+    /// Number of SMBIOS structures
+    struct_count: u16,
+    /// BCD revision
+    bcd_revision: u8,
+}
+
+/// SMBIOS 3.0 Entry Point structure (64-bit)
+///
+/// Reference: SMBIOS Reference Specification, Chapter 5.2.2
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct Smbios30Entry {
+    /// Anchor string "_SM3_"
+    anchor: [u8; 5],
+    /// Checksum of entry point structure
+    checksum: u8,
+    /// Length of entry point structure (0x18 for 3.0)
+    length: u8,
+    /// SMBIOS major version
+    major_version: u8,
+    /// SMBIOS minor version
+    minor_version: u8,
+    /// SMBIOS docrev
+    docrev: u8,
+    /// Entry point revision
+    entry_point_rev: u8,
+    /// Reserved
+    reserved: u8,
+    /// Maximum size of structure table
+    struct_table_max_size: u32,
+    /// 64-bit physical address of structure table
+    struct_table_address: u64,
+}
+
 /// EFI System Table
 ///
 /// This is the main entry point structure passed to EFI applications.
@@ -278,7 +342,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -498,7 +562,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");
@@ -579,6 +643,168 @@ pub fn install_acpi_tables(rsdp: u64) {
         count,
         unsafe { SYSTEM_TABLE.number_of_table_entries }
     );
+}
+
+/// Install SMBIOS tables from coreboot
+///
+/// Coreboot provides SMBIOS tables via a CBMEM entry. The address points to
+/// the SMBIOS entry point structure(s). Coreboot may provide:
+/// - SMBIOS 2.1 entry point (32-bit, anchor "_SM_") - if tables are below 4GB
+/// - SMBIOS 3.0 entry point (64-bit, anchor "_SM3_") - always present
+///
+/// We install the appropriate configuration table(s) based on what we find.
+pub fn install_smbios_tables(smbios_addr: u64) {
+    if smbios_addr == 0 {
+        log::warn!("SMBIOS address is null, skipping SMBIOS table installation");
+        return;
+    }
+
+    log::info!("Installing SMBIOS tables from {:#x}", smbios_addr);
+
+    let mut found_21 = false;
+    let mut found_30 = false;
+    let mut addr_21: u64 = 0;
+    let mut addr_30: u64 = 0;
+
+    // Try to find SMBIOS 2.1 entry point ("_SM_")
+    let ptr = smbios_addr as *const u8;
+    let bytes_21 = unsafe { core::slice::from_raw_parts(ptr, 4) };
+
+    if bytes_21 == b"_SM_" {
+        // This is an SMBIOS 2.1 entry point
+        let entry_bytes =
+            unsafe { core::slice::from_raw_parts(ptr, core::mem::size_of::<Smbios21Entry>()) };
+
+        if let Ok((entry, _)) = Smbios21Entry::read_from_prefix(entry_bytes) {
+            // Copy packed struct fields to avoid misaligned references
+            let major = entry.major_version;
+            let minor = entry.minor_version;
+            let length = entry.length;
+            let table_addr = entry.struct_table_address;
+            let struct_count = entry.struct_count;
+            let table_length = entry.struct_table_length;
+
+            // Validate intermediate anchor
+            if &entry.intermediate_anchor == b"_DMI_" {
+                log::info!(
+                    "Found SMBIOS {}.{} entry point at {:#x} (32-bit)",
+                    major,
+                    minor,
+                    smbios_addr
+                );
+                log::debug!(
+                    "  Structure table at {:#x}, {} structures, {} bytes",
+                    table_addr,
+                    struct_count,
+                    table_length
+                );
+                found_21 = true;
+                addr_21 = smbios_addr;
+
+                // SMBIOS 3.0 entry point typically follows after the 2.1 entry
+                // It's usually at the next 16-byte aligned address after the 2.1 entry
+                let entry_30_offset = ((length as usize + 15) / 16) * 16;
+                let ptr_30 = unsafe { ptr.add(entry_30_offset) };
+                let bytes_30 = unsafe { core::slice::from_raw_parts(ptr_30, 5) };
+
+                if bytes_30 == b"_SM3_" {
+                    let entry30_bytes = unsafe {
+                        core::slice::from_raw_parts(ptr_30, core::mem::size_of::<Smbios30Entry>())
+                    };
+
+                    if let Ok((entry30, _)) = Smbios30Entry::read_from_prefix(entry30_bytes) {
+                        // Copy packed struct fields to avoid misaligned references
+                        let major30 = entry30.major_version;
+                        let minor30 = entry30.minor_version;
+                        let table_addr30 = entry30.struct_table_address;
+                        let table_max_size = entry30.struct_table_max_size;
+                        let entry30_addr = smbios_addr + entry_30_offset as u64;
+
+                        log::info!(
+                            "Found SMBIOS {}.{} entry point at {:#x} (64-bit)",
+                            major30,
+                            minor30,
+                            entry30_addr
+                        );
+                        log::debug!(
+                            "  Structure table at {:#x}, max size {} bytes",
+                            table_addr30,
+                            table_max_size
+                        );
+                        found_30 = true;
+                        addr_30 = entry30_addr;
+                    }
+                }
+            } else {
+                log::warn!(
+                    "SMBIOS 2.1 entry has invalid intermediate anchor: {:?}",
+                    &entry.intermediate_anchor
+                );
+            }
+        }
+    } else {
+        // Check if it's directly an SMBIOS 3.0 entry point
+        let bytes_30 = unsafe { core::slice::from_raw_parts(ptr, 5) };
+
+        if bytes_30 == b"_SM3_" {
+            let entry30_bytes =
+                unsafe { core::slice::from_raw_parts(ptr, core::mem::size_of::<Smbios30Entry>()) };
+
+            if let Ok((entry30, _)) = Smbios30Entry::read_from_prefix(entry30_bytes) {
+                // Copy packed struct fields to avoid misaligned references
+                let major30 = entry30.major_version;
+                let minor30 = entry30.minor_version;
+                let table_addr30 = entry30.struct_table_address;
+                let table_max_size = entry30.struct_table_max_size;
+
+                log::info!(
+                    "Found SMBIOS {}.{} entry point at {:#x} (64-bit only)",
+                    major30,
+                    minor30,
+                    smbios_addr
+                );
+                log::debug!(
+                    "  Structure table at {:#x}, max size {} bytes",
+                    table_addr30,
+                    table_max_size
+                );
+                found_30 = true;
+                addr_30 = smbios_addr;
+            }
+        } else {
+            log::warn!(
+                "Unknown SMBIOS signature at {:#x}: {:02x?}",
+                smbios_addr,
+                bytes_21
+            );
+            return;
+        }
+    }
+
+    // Install configuration tables
+    // Per UEFI spec, we install SMBIOS 3.0 with SMBIOS3_TABLE_GUID
+    // and SMBIOS 2.1 with SMBIOS_TABLE_GUID for backward compatibility
+    if found_30 {
+        let status = install_configuration_table(&SMBIOS3_TABLE_GUID, addr_30 as *mut c_void);
+        if status == efi::Status::SUCCESS {
+            log::info!("Installed SMBIOS 3.0 configuration table at {:#x}", addr_30);
+        } else {
+            log::error!("Failed to install SMBIOS 3.0 table: {:?}", status);
+        }
+    }
+
+    if found_21 {
+        let status = install_configuration_table(&SMBIOS_TABLE_GUID, addr_21 as *mut c_void);
+        if status == efi::Status::SUCCESS {
+            log::info!("Installed SMBIOS 2.1 configuration table at {:#x}", addr_21);
+        } else {
+            log::error!("Failed to install SMBIOS 2.1 table: {:?}", status);
+        }
+    }
+
+    if !found_21 && !found_30 {
+        log::warn!("No valid SMBIOS entry point found at {:#x}", smbios_addr);
+    }
 }
 
 /// Update the system table CRC32

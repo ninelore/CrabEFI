@@ -34,7 +34,14 @@ mod tags {
     pub const CB_TAG_FRAMEBUFFER: u32 = 0x0012;
     pub const CB_TAG_TIMESTAMPS: u32 = 0x0016;
     pub const CB_TAG_CBMEM_CONSOLE: u32 = 0x0017;
+    pub const CB_TAG_CBMEM_ENTRY: u32 = 0x0031;
     pub const CB_TAG_ACPI_RSDP: u32 = 0x0043;
+}
+
+/// CBMEM IDs (used with CB_TAG_CBMEM_ENTRY)
+mod cbmem_ids {
+    /// SMBIOS tables CBMEM ID (ASCII "SMBT")
+    pub const CBMEM_ID_SMBIOS: u32 = 0x534d4254;
 }
 
 /// Coreboot header structure
@@ -135,6 +142,20 @@ struct CbCbmemRef {
     cbmem_addr: u64,
 }
 
+/// CBMEM entry record (used for SMBIOS, etc.)
+///
+/// This record provides pointers to CBMEM regions by ID.
+/// Reference: coreboot/src/commonlib/include/commonlib/coreboot_tables.h
+#[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
+struct CbCbmemEntry {
+    tag: u32,
+    size: u32,
+    address: u64,
+    entry_size: u32,
+    id: u32,
+}
+
 /// Serial port information
 #[derive(Debug, Clone)]
 pub struct SerialInfo {
@@ -159,6 +180,8 @@ pub struct CorebootInfo {
     pub version: Option<&'static str>,
     /// CBMEM console address
     pub cbmem_console: Option<u64>,
+    /// SMBIOS tables address (from CBMEM entry)
+    pub smbios: Option<u64>,
 }
 
 impl CorebootInfo {
@@ -170,6 +193,7 @@ impl CorebootInfo {
             acpi_rsdp: None,
             version: None,
             cbmem_console: None,
+            smbios: None,
         }
     }
 }
@@ -398,6 +422,9 @@ fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
         }
         tags::CB_TAG_CBMEM_CONSOLE => {
             parse_cbmem_console(record_bytes, info);
+        }
+        tags::CB_TAG_CBMEM_ENTRY => {
+            parse_cbmem_entry(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
             // Version string follows the 8-byte record header
@@ -640,4 +667,41 @@ fn parse_cbmem_console(record_bytes: &[u8], info: &mut CorebootInfo) {
     info.cbmem_console = Some(cbmem_addr);
 
     log::debug!("CBMEM console: {:#x}", cbmem_addr);
+}
+
+/// Parse CBMEM entry record
+///
+/// CBMEM entries provide pointers to various firmware data regions by ID.
+/// We specifically look for SMBIOS tables (CBMEM_ID_SMBIOS).
+///
+/// This function is safe - it uses zerocopy to parse the CBMEM entry struct.
+fn parse_cbmem_entry(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((entry, _)) = CbCbmemEntry::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse CBMEM entry record");
+        return;
+    };
+
+    let id = entry.id;
+    let address = entry.address;
+    let entry_size = entry.entry_size;
+
+    match id {
+        cbmem_ids::CBMEM_ID_SMBIOS => {
+            info.smbios = Some(address);
+            log::info!(
+                "SMBIOS tables found at {:#x} (size {} bytes)",
+                address,
+                entry_size
+            );
+        }
+        _ => {
+            // Log other CBMEM entries at trace level for debugging
+            log::trace!(
+                "CBMEM entry: id={:#x}, address={:#x}, size={}",
+                id,
+                address,
+                entry_size
+            );
+        }
+    }
 }
