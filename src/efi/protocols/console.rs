@@ -728,6 +728,33 @@ extern "efiapi" fn text_output_clear_screen(_this: *mut SimpleTextOutputProtocol
         CONSOLE_MODE.cursor_row = 0;
     }
 
+    // Clear the ENTIRE framebuffer (bootloader expects full screen)
+    state::with_console_mut(|console| {
+        let Some(ref fb) = console.efi_framebuffer else {
+            return;
+        };
+
+        let total_rows = fb.y_resolution / CHAR_HEIGHT;
+        let row_stride = fb.bytes_per_line as usize;
+
+        // Clear the entire screen (from row 0 to bottom)
+        for row in 0..total_rows {
+            let y_base = row * CHAR_HEIGHT;
+            for line in 0..CHAR_HEIGHT {
+                let offset = ((y_base + line) as usize) * row_stride;
+                unsafe {
+                    let dst = (fb.physical_address as *mut u8).add(offset);
+                    core::slice::from_raw_parts_mut(dst, row_stride).fill(0);
+                }
+            }
+        }
+
+        // Reset console to use full screen (bootloader wants the whole display)
+        console.start_row = 0;
+        console.dimensions = (fb.x_resolution / CHAR_WIDTH, total_rows);
+        console.cursor_pos = (0, 0);
+    });
+
     Status::SUCCESS
 }
 
@@ -748,6 +775,13 @@ extern "efiapi" fn text_output_set_cursor_position(
         CONSOLE_MODE.cursor_column = column as i32;
         CONSOLE_MODE.cursor_row = row as i32;
     }
+
+    // Update framebuffer cursor position
+    // Row is relative to the EFI console area, so add start_row to get absolute row
+    state::with_console_mut(|console| {
+        let start_row = console.start_row;
+        console.cursor_pos = (column as u32, start_row + row as u32);
+    });
 
     Status::SUCCESS
 }
