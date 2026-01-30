@@ -8,7 +8,8 @@
 //! - USB HID Specification 1.11
 //! - libpayload usbhid.c
 
-use super::controller::{UsbController, UsbError, hid_request, req_type};
+use super::controller::{hid_request, req_type, UsbController, UsbError};
+use crate::time::Timeout;
 use spin::Mutex;
 
 // ============================================================================
@@ -78,6 +79,11 @@ impl KeyboardReport {
 // USB HID Keyboard State
 // ============================================================================
 
+/// Initial delay before key repeat starts (ms)
+const REPEAT_INITIAL_DELAY_MS: u64 = 500;
+/// Interval between key repeats (ms) - about 33 chars/sec
+const REPEAT_INTERVAL_MS: u64 = 30;
+
 /// USB HID keyboard state
 pub struct UsbHidKeyboard {
     /// Controller index
@@ -107,8 +113,10 @@ pub struct UsbHidKeyboard {
     write_idx: usize,
     /// Last key for repeat
     last_key: u16,
-    /// Repeat counter
-    repeat_counter: u32,
+    /// Timeout for initial repeat delay (None = no key held)
+    repeat_delay_timeout: Option<Timeout>,
+    /// Timeout for repeat interval
+    repeat_interval_timeout: Option<Timeout>,
 }
 
 impl UsbHidKeyboard {
@@ -133,7 +141,8 @@ impl UsbHidKeyboard {
             read_idx: 0,
             write_idx: 0,
             last_key: 0,
-            repeat_counter: 0,
+            repeat_delay_timeout: None,
+            repeat_interval_timeout: None,
         }
     }
 
@@ -219,28 +228,48 @@ impl UsbHidKeyboard {
                     _ => {}
                 }
 
-                // Set last key for repeat
+                // Set last key for repeat - start the initial delay timer
                 self.last_key = efi_key;
-                self.repeat_counter = 0;
+                self.repeat_delay_timeout = Some(Timeout::from_ms(REPEAT_INITIAL_DELAY_MS));
+                self.repeat_interval_timeout = None;
             }
         }
 
         // Check for key release
         if !report.keys.iter().any(|&k| k != 0) {
             self.last_key = 0;
-            self.repeat_counter = 0;
+            self.repeat_delay_timeout = None;
+            self.repeat_interval_timeout = None;
         }
 
         self.prev_report = *report;
     }
 
-    /// Handle key repeat
+    /// Handle key repeat using Timeout-based timing
     pub fn handle_repeat(&mut self) {
-        if self.last_key != 0 {
-            self.repeat_counter += 1;
-            // Initial delay of ~500ms (50 polls at 10ms), then repeat at ~30ms (3 polls)
-            if self.repeat_counter > 50 && (self.repeat_counter - 50).is_multiple_of(3) {
+        if self.last_key == 0 {
+            return;
+        }
+
+        // Check if we're still in the initial delay period
+        if let Some(ref delay_timeout) = self.repeat_delay_timeout {
+            if !delay_timeout.is_expired() {
+                // Still waiting for initial delay
+                return;
+            }
+            // Initial delay expired - start repeating
+            self.repeat_delay_timeout = None;
+            self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
+            self.enqueue_key(self.last_key);
+            return;
+        }
+
+        // Check repeat interval
+        if let Some(ref interval_timeout) = self.repeat_interval_timeout {
+            if interval_timeout.is_expired() {
+                // Time for another repeat
                 self.enqueue_key(self.last_key);
+                self.repeat_interval_timeout = Some(Timeout::from_ms(REPEAT_INTERVAL_MS));
             }
         }
     }
@@ -612,6 +641,13 @@ impl UsbHidKeyboard {
 /// Global USB keyboard instance
 static USB_KEYBOARD: Mutex<Option<UsbHidKeyboard>> = Mutex::new(None);
 
+/// Minimum poll interval in milliseconds
+/// USB keyboards typically have 8-10ms poll intervals
+const MIN_POLL_INTERVAL_MS: u64 = 8;
+
+/// Next poll timeout (None = poll immediately)
+static NEXT_POLL_TIMEOUT: Mutex<Option<Timeout>> = Mutex::new(None);
+
 /// Initialize USB keyboard from a controller
 pub fn init_keyboard<C: UsbController>(
     controller: &mut C,
@@ -682,7 +718,30 @@ pub fn get_key() -> Option<(u16, u16)> {
 }
 
 /// Poll USB keyboard (called periodically)
+///
+/// This function implements rate limiting to avoid polling too frequently.
+/// USB keyboards typically have 8-10ms poll intervals, so polling faster
+/// than that provides no benefit and can cause issues with key repeat.
 pub fn poll<C: UsbController>(controller: &mut C) {
+    // Rate limit: only poll every MIN_POLL_INTERVAL_MS
+    {
+        let mut timeout_guard = NEXT_POLL_TIMEOUT.lock();
+        if let Some(ref timeout) = *timeout_guard {
+            if !timeout.is_expired() {
+                // Not enough time has passed, skip this poll
+                // But still check key repeat with the current keyboard state
+                drop(timeout_guard); // Release lock before acquiring keyboard lock
+                let mut keyboard_guard = USB_KEYBOARD.lock();
+                if let Some(keyboard) = keyboard_guard.as_mut() {
+                    keyboard.handle_repeat();
+                }
+                return;
+            }
+        }
+        // Set next poll timeout
+        *timeout_guard = Some(Timeout::from_ms(MIN_POLL_INTERVAL_MS));
+    }
+
     let mut keyboard_guard = USB_KEYBOARD.lock();
     let keyboard = match keyboard_guard.as_mut() {
         Some(k) => k,
