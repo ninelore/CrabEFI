@@ -4,6 +4,7 @@
 //! Used to read files from the EFI System Partition.
 
 use crate::drivers::block::BlockDevice;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// Standard sector size (512 bytes) - used for FAT calculations
 pub const SECTOR_SIZE: usize = 512;
@@ -13,7 +14,7 @@ const MAX_BLOCK_SIZE: usize = 4096;
 
 /// FAT Boot Parameter Block (BPB) - common fields
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 struct BiosParameterBlock {
     /// Jump instruction (3 bytes)
     jmp: [u8; 3],
@@ -47,7 +48,7 @@ struct BiosParameterBlock {
 
 /// FAT32 Extended Boot Record
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 struct Fat32Ebr {
     /// Sectors per FAT (32-bit)
     sectors_per_fat_32: u32,
@@ -79,7 +80,7 @@ struct Fat32Ebr {
 
 /// FAT directory entry
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct DirectoryEntry {
     /// Short name (8 characters)
     name: [u8; 8],
@@ -273,11 +274,12 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             .read_block(partition_start, &mut buffer[..block_size])
             .map_err(|_| FatError::ReadError)?;
 
-        // Parse BPB
-        let bpb =
-            unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const BiosParameterBlock) };
+        // Parse BPB using zerocopy
+        let bpb = BiosParameterBlock::read_from_prefix(&buffer)
+            .map_err(|_| FatError::InvalidBpb)?
+            .0;
 
-        // Copy fields from packed struct to avoid alignment issues
+        // With zerocopy's Unaligned derive, we can safely access packed fields
         let bpb_bytes_per_sector = bpb.bytes_per_sector;
         let bpb_sectors_per_cluster = bpb.sectors_per_cluster;
         let bpb_num_fats = bpb.num_fats;
@@ -332,9 +334,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
         let sectors_per_fat = if bpb.sectors_per_fat_16 != 0 {
             bpb.sectors_per_fat_16 as u32
         } else {
-            // FAT32: read extended BPB
-            let ebr =
-                unsafe { core::ptr::read_unaligned(buffer[36..].as_ptr() as *const Fat32Ebr) };
+            // FAT32: read extended BPB using zerocopy
+            let ebr = Fat32Ebr::read_from_prefix(&buffer[36..])
+                .map_err(|_| FatError::InvalidBpb)?
+                .0;
             ebr.sectors_per_fat_32
         };
 
@@ -365,8 +368,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
 
         // Root cluster (FAT32 only)
         let root_cluster = if fat_type == FatType::Fat32 {
-            let ebr =
-                unsafe { core::ptr::read_unaligned(buffer[36..].as_ptr() as *const Fat32Ebr) };
+            // Already parsed ebr above, but re-read for clarity
+            let ebr = Fat32Ebr::read_from_prefix(&buffer[36..])
+                .map_err(|_| FatError::InvalidBpb)?
+                .0;
             ebr.root_cluster
         } else {
             0
@@ -645,8 +650,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                     if offset + 32 > read_size {
                         break;
                     }
-                    let entry = unsafe {
-                        core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                    // Parse directory entry using zerocopy
+                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
+                        Ok((e, _)) => e,
+                        Err(_) => break,
                     };
 
                     if entry.is_end() {
@@ -680,8 +687,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
 
                 for i in 0..entries_per_cluster {
                     let offset = i * 32;
-                    let entry = unsafe {
-                        core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                    // Parse directory entry using zerocopy
+                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
+                        Ok((e, _)) => e,
+                        Err(_) => break,
                     };
 
                     if entry.is_end() {
@@ -865,8 +874,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
                     if offset + 32 > device_block_size {
                         break;
                     }
-                    let entry = unsafe {
-                        core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                    // Parse directory entry using zerocopy
+                    let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
+                        Ok((e, _)) => e,
+                        Err(_) => break,
                     };
 
                     if entry.is_end() {
@@ -910,8 +921,10 @@ impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
             // Search entries
             for i in 0..entries_per_cluster {
                 let offset = i * 32;
-                let entry = unsafe {
-                    core::ptr::read_unaligned(buffer[offset..].as_ptr() as *const DirectoryEntry)
+                // Parse directory entry using zerocopy
+                let entry = match DirectoryEntry::read_from_prefix(&buffer[offset..]) {
+                    Ok((e, _)) => e,
+                    Err(_) => break,
                 };
 
                 if entry.is_end() {

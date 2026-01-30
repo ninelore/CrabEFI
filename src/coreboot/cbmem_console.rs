@@ -8,11 +8,13 @@
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU64, Ordering};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// CBMEM console structure header
 ///
 /// The actual console buffer follows immediately after this header.
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbmemConsoleHeader {
     /// Size of the console buffer (not including this header)
     size: u32,
@@ -44,9 +46,10 @@ pub fn init(addr: u64) {
     }
 
     // Verify the console looks valid before enabling
-    let header = addr as *const CbmemConsoleHeader;
     unsafe {
-        let size = core::ptr::addr_of!((*header).size).read_unaligned();
+        let header = &*(addr as *const CbmemConsoleHeader);
+        // With zerocopy's Unaligned derive, we can safely access packed fields directly
+        let size = header.size;
         // Sanity check: size should be reasonable (at least 1KB, at most 1MB)
         if (1024..=1024 * 1024).contains(&size) {
             CBMEM_CONSOLE_ADDR.store(addr, Ordering::Release);
@@ -85,11 +88,13 @@ pub fn write_bytes(data: &[u8]) {
         return;
     }
 
-    let header = addr as *mut CbmemConsoleHeader;
-
     unsafe {
-        let size = core::ptr::addr_of!((*header).size).read_unaligned();
-        let cursor_ptr = core::ptr::addr_of_mut!((*header).cursor);
+        // For reading size, we can use zerocopy's Unaligned trait
+        let header = &*(addr as *const CbmemConsoleHeader);
+        let size = header.size;
+
+        // For writing cursor, we need to use raw pointer operations
+        let cursor_ptr = core::ptr::addr_of_mut!((*(addr as *mut CbmemConsoleHeader)).cursor);
         let body = (addr as *mut u8).add(core::mem::size_of::<CbmemConsoleHeader>());
 
         let mut buffer = data.as_ptr();

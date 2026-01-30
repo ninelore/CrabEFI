@@ -11,6 +11,7 @@ use r_efi::efi::{Char16, Guid, Status};
 use r_efi::protocols::file as efi_file;
 use r_efi::protocols::simple_file_system as efi_sfs;
 use spin::Mutex;
+use zerocopy::FromBytes;
 
 use crate::drivers::block::{AnyBlockDevice, BlockDevice};
 use crate::fs::fat::{DirectoryEntry, FatFilesystem, FatType};
@@ -804,7 +805,9 @@ fn create_file_entry(first_cluster: u32, file_size: u32) -> DirectoryEntry {
     // attr at offset 11 - set to 0 (regular file)
     bytes[11] = 0;
 
-    unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const DirectoryEntry) }
+    // Parse using zerocopy (safe because DirectoryEntry derives FromBytes)
+    DirectoryEntry::read_from_bytes(&bytes)
+        .expect("DirectoryEntry should always be readable from 32 bytes")
 }
 
 /// Read directory entries

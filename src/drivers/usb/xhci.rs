@@ -8,6 +8,7 @@ use crate::efi;
 use crate::time::{Timeout, wait_for};
 use core::ptr;
 use core::sync::atomic::{Ordering, fence};
+use zerocopy::FromBytes;
 
 use super::controller::{DeviceDescriptor, desc_type, parse_configuration, req_type, request};
 
@@ -948,7 +949,10 @@ impl XhciController {
             Some(&mut desc),
         )?;
 
-        Ok(unsafe { ptr::read_unaligned(desc.as_ptr() as *const DeviceDescriptor) })
+        // Parse device descriptor using zerocopy
+        DeviceDescriptor::read_from_prefix(&desc)
+            .map(|(d, _)| d)
+            .map_err(|_| XhciError::TransferFailed(0))
     }
 
     /// Set configuration

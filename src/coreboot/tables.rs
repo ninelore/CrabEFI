@@ -6,6 +6,7 @@
 use super::framebuffer::FramebufferInfo;
 use super::memory::{MemoryRegion, MemoryType};
 use heapless::Vec;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// Maximum number of memory regions we can store
 const MAX_MEMORY_REGIONS: usize = 64;
@@ -38,6 +39,7 @@ mod tags {
 
 /// Coreboot header structure
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbHeader {
     signature: [u8; 4],
     header_bytes: u32,
@@ -49,6 +51,7 @@ struct CbHeader {
 
 /// Coreboot record header
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbRecord {
     tag: u32,
     size: u32,
@@ -56,6 +59,7 @@ struct CbRecord {
 
 /// Coreboot memory range
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbMemoryRange {
     start: u64,
     size: u64,
@@ -64,6 +68,7 @@ struct CbMemoryRange {
 
 /// Coreboot serial port info
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbSerial {
     tag: u32,
     size: u32,
@@ -77,6 +82,7 @@ struct CbSerial {
 
 /// Coreboot framebuffer info
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbFramebuffer {
     tag: u32,
     size: u32,
@@ -97,6 +103,7 @@ struct CbFramebuffer {
 
 /// Forward pointer to another coreboot table
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbForward {
     tag: u32,
     size: u32,
@@ -105,6 +112,7 @@ struct CbForward {
 
 /// ACPI RSDP pointer
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbAcpiRsdp {
     tag: u32,
     size: u32,
@@ -113,6 +121,7 @@ struct CbAcpiRsdp {
 
 /// CBMEM reference (used for console, timestamps, etc.)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CbCbmemRef {
     tag: u32,
     size: u32,
@@ -183,6 +192,7 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
         }
     };
 
+    // Safety: We've validated that header points to a valid coreboot table
     unsafe {
         // Verify signature "LBIO"
         if &(*header).signature != b"LBIO" {
@@ -191,31 +201,34 @@ pub unsafe fn parse(ptr: *const u8) -> CorebootInfo {
             return info;
         }
 
-        // Read fields from packed struct using read_unaligned
-        let table_entries = core::ptr::addr_of!((*header).table_entries).read_unaligned();
-        let table_bytes = core::ptr::addr_of!((*header).table_bytes).read_unaligned();
-        let header_bytes = core::ptr::addr_of!((*header).header_bytes).read_unaligned();
+        let table_bytes = (*header).table_bytes;
+        let header_bytes = (*header).header_bytes;
 
-        log::debug!(
-            "Found coreboot header: {} table entries, {} bytes",
-            table_entries,
-            table_bytes
-        );
+        log::debug!("Found coreboot header: {} bytes of tables", table_bytes);
 
         // Parse table entries
         let table_start = (header as *const u8).add(header_bytes as usize);
         let mut offset = 0u32;
 
         while offset < table_bytes {
-            let record = table_start.add(offset as usize) as *const CbRecord;
-            let record_size = core::ptr::addr_of!((*record).size).read_unaligned();
+            let record_ptr = table_start.add(offset as usize);
+
+            // Read record header to get size
+            let record_header_bytes = core::slice::from_raw_parts(record_ptr, 8);
+            let Ok((record_header, _)) = CbRecord::read_from_prefix(record_header_bytes) else {
+                log::warn!("Failed to parse record header");
+                break;
+            };
+            let record_size = record_header.size;
 
             if record_size < 8 {
                 log::warn!("Invalid record size: {}", record_size);
                 break;
             }
 
-            parse_record(record, &mut info);
+            // Create slice for the full record and call safe parse_record
+            let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
+            parse_record(record_bytes, &mut info);
 
             offset += record_size;
         }
@@ -345,37 +358,53 @@ unsafe fn scan_for_header_at(base: *const u8, size: usize) -> Option<*const CbHe
     None
 }
 
-/// Parse a single coreboot record
-unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
-    let tag = core::ptr::addr_of!((*record).tag).read_unaligned();
+/// Parse a single coreboot record from a byte slice
+///
+/// # Arguments
+/// * `record_bytes` - Byte slice containing the full record (header + data)
+/// * `info` - CorebootInfo to populate
+///
+/// This function is safe because it uses zerocopy to validate all struct parsing.
+/// The `parse_forward` case still requires unsafe internally to follow the pointer.
+fn parse_record(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((header, _)) = CbRecord::read_from_prefix(record_bytes) else {
+        return;
+    };
+    let tag = header.tag;
 
     match tag {
         tags::CB_TAG_MEMORY => {
-            parse_memory(record, info);
+            parse_memory(record_bytes, info);
         }
         tags::CB_TAG_SERIAL => {
-            parse_serial(record, info);
+            parse_serial(record_bytes, info);
         }
         tags::CB_TAG_FRAMEBUFFER => {
-            parse_framebuffer(record, info);
+            parse_framebuffer(record_bytes, info);
         }
         tags::CB_TAG_FORWARD => {
-            parse_forward(record, info);
+            // This one still needs unsafe to follow the pointer
+            unsafe { parse_forward(record_bytes, info) };
         }
         tags::CB_TAG_ACPI_RSDP => {
-            parse_acpi_rsdp(record, info);
+            parse_acpi_rsdp(record_bytes, info);
         }
         tags::CB_TAG_CBMEM_CONSOLE => {
-            parse_cbmem_console(record, info);
+            parse_cbmem_console(record_bytes, info);
         }
         tags::CB_TAG_VERSION => {
-            // Version string follows the record header
-            let string_ptr = (record as *const u8).add(8);
-            let record_size = core::ptr::addr_of!((*record).size).read_unaligned();
-            let len = record_size as usize - 8;
-            if len > 0 {
-                let slice = core::slice::from_raw_parts(string_ptr, len);
-                if let Ok(s) = core::str::from_utf8(slice) {
+            // Version string follows the 8-byte record header
+            // Note: We need 'static lifetime since coreboot tables persist
+            // for the entire boot process. This is inherently unsafe as we're
+            // extending the lifetime, but is correct because the tables are in
+            // firmware memory.
+            if record_bytes.len() > 8 {
+                let len = record_bytes.len() - 8;
+                // Safety: The coreboot tables are in firmware memory that persists
+                // for the entire boot, so 'static lifetime is appropriate.
+                let string_bytes: &'static [u8] =
+                    unsafe { core::slice::from_raw_parts(record_bytes.as_ptr().add(8), len) };
+                if let Ok(s) = core::str::from_utf8(string_bytes) {
                     info.version = Some(s.trim_end_matches('\0'));
                     log::debug!("Coreboot version: {}", info.version.unwrap());
                 }
@@ -388,20 +417,27 @@ unsafe fn parse_record(record: *const CbRecord, info: &mut CorebootInfo) {
 }
 
 /// Parse memory map from coreboot table
-unsafe fn parse_memory(record: *const CbRecord, info: &mut CorebootInfo) {
-    let size = core::ptr::addr_of!((*record).size).read_unaligned();
-    let data = (record as *const u8).add(8); // Skip header
-    let num_entries = (size as usize - 8) / core::mem::size_of::<CbMemoryRange>();
+///
+/// This function is safe - it uses zerocopy to iterate through memory ranges.
+fn parse_memory(record_bytes: &[u8], info: &mut CorebootInfo) {
+    // Skip the 8-byte record header to get to the memory range array
+    if record_bytes.len() <= 8 {
+        return;
+    }
+    let data = &record_bytes[8..];
+    let num_entries = data.len() / core::mem::size_of::<CbMemoryRange>();
 
     log::debug!("Parsing {} memory regions", num_entries);
 
-    for i in 0..num_entries {
-        let range_ptr = data.add(i * core::mem::size_of::<CbMemoryRange>()) as *const CbMemoryRange;
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let Ok((range, rest)) = CbMemoryRange::read_from_prefix(remaining) else {
+            break;
+        };
 
-        // Read fields using read_unaligned to handle packed struct
-        let start = core::ptr::addr_of!((*range_ptr).start).read_unaligned();
-        let range_size = core::ptr::addr_of!((*range_ptr).size).read_unaligned();
-        let mem_type = core::ptr::addr_of!((*range_ptr).mem_type).read_unaligned();
+        let start = range.start;
+        let range_size = range.size;
+        let mem_type = range.mem_type;
 
         let region_type = match mem_type {
             1 => MemoryType::Ram,
@@ -423,18 +459,25 @@ unsafe fn parse_memory(record: *const CbRecord, info: &mut CorebootInfo) {
             log::warn!("Memory map full, ignoring remaining regions");
             break;
         }
+
+        remaining = rest;
     }
 }
 
 /// Parse serial port information
-unsafe fn parse_serial(record: *const CbRecord, info: &mut CorebootInfo) {
-    let serial = record as *const CbSerial;
+///
+/// This function is safe - it uses zerocopy to parse the serial struct.
+fn parse_serial(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((serial, _)) = CbSerial::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse serial record");
+        return;
+    };
 
-    let serial_type = core::ptr::addr_of!((*serial).serial_type).read_unaligned();
-    let baseaddr = core::ptr::addr_of!((*serial).baseaddr).read_unaligned();
-    let baud = core::ptr::addr_of!((*serial).baud).read_unaligned();
-    let regwidth = core::ptr::addr_of!((*serial).regwidth).read_unaligned();
-    let input_hertz = core::ptr::addr_of!((*serial).input_hertz).read_unaligned();
+    let serial_type = serial.serial_type;
+    let baseaddr = serial.baseaddr;
+    let baud = serial.baud;
+    let regwidth = serial.regwidth;
+    let input_hertz = serial.input_hertz;
 
     info.serial = Some(SerialInfo {
         serial_type,
@@ -453,20 +496,25 @@ unsafe fn parse_serial(record: *const CbRecord, info: &mut CorebootInfo) {
 }
 
 /// Parse framebuffer information
-unsafe fn parse_framebuffer(record: *const CbRecord, info: &mut CorebootInfo) {
-    let fb = record as *const CbFramebuffer;
+///
+/// This function is safe - it uses zerocopy to parse the framebuffer struct.
+fn parse_framebuffer(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((fb, _)) = CbFramebuffer::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse framebuffer record");
+        return;
+    };
 
-    let physical_address = core::ptr::addr_of!((*fb).physical_address).read_unaligned();
-    let x_resolution = core::ptr::addr_of!((*fb).x_resolution).read_unaligned();
-    let y_resolution = core::ptr::addr_of!((*fb).y_resolution).read_unaligned();
-    let bytes_per_line = core::ptr::addr_of!((*fb).bytes_per_line).read_unaligned();
-    let bits_per_pixel = core::ptr::addr_of!((*fb).bits_per_pixel).read_unaligned();
-    let red_mask_pos = core::ptr::addr_of!((*fb).red_mask_pos).read_unaligned();
-    let red_mask_size = core::ptr::addr_of!((*fb).red_mask_size).read_unaligned();
-    let green_mask_pos = core::ptr::addr_of!((*fb).green_mask_pos).read_unaligned();
-    let green_mask_size = core::ptr::addr_of!((*fb).green_mask_size).read_unaligned();
-    let blue_mask_pos = core::ptr::addr_of!((*fb).blue_mask_pos).read_unaligned();
-    let blue_mask_size = core::ptr::addr_of!((*fb).blue_mask_size).read_unaligned();
+    let physical_address = fb.physical_address;
+    let x_resolution = fb.x_resolution;
+    let y_resolution = fb.y_resolution;
+    let bytes_per_line = fb.bytes_per_line;
+    let bits_per_pixel = fb.bits_per_pixel;
+    let red_mask_pos = fb.red_mask_pos;
+    let red_mask_size = fb.red_mask_size;
+    let green_mask_pos = fb.green_mask_pos;
+    let green_mask_size = fb.green_mask_size;
+    let blue_mask_pos = fb.blue_mask_pos;
+    let blue_mask_size = fb.blue_mask_size;
 
     info.framebuffer = Some(FramebufferInfo {
         physical_address,
@@ -492,14 +540,23 @@ unsafe fn parse_framebuffer(record: *const CbRecord, info: &mut CorebootInfo) {
 }
 
 /// Parse forward pointer and follow it
-unsafe fn parse_forward(record: *const CbRecord, info: &mut CorebootInfo) {
-    let forward = record as *const CbForward;
-    let forward_addr = core::ptr::addr_of!((*forward).forward).read_unaligned();
+///
+/// # Safety
+/// This function must follow a memory pointer from the coreboot tables,
+/// which requires trusting that the pointer is valid.
+unsafe fn parse_forward(record_bytes: &[u8], info: &mut CorebootInfo) {
+    // Safely parse the forward record using zerocopy
+    let Ok((forward, _)) = CbForward::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse forward record");
+        return;
+    };
+    let forward_addr = forward.forward;
     let new_ptr = forward_addr as *const u8;
 
     log::debug!("Following forward pointer to {:#x}", forward_addr);
 
     // Parse the forwarded table directly into info (no recursion)
+    // Safety: We trust the forward pointer from coreboot tables
     let header = match find_header(new_ptr) {
         Some(h) => h,
         None => {
@@ -514,14 +571,11 @@ unsafe fn parse_forward(record: *const CbRecord, info: &mut CorebootInfo) {
         return;
     }
 
-    // Read fields from packed struct using read_unaligned
-    let table_entries = core::ptr::addr_of!((*header).table_entries).read_unaligned();
-    let table_bytes = core::ptr::addr_of!((*header).table_bytes).read_unaligned();
-    let header_bytes = core::ptr::addr_of!((*header).header_bytes).read_unaligned();
+    let table_bytes = (*header).table_bytes;
+    let header_bytes = (*header).header_bytes;
 
     log::debug!(
-        "Found coreboot header: {} table entries, {} bytes",
-        table_entries,
+        "Found forwarded coreboot header: {} bytes of tables",
         table_bytes
     );
 
@@ -530,33 +584,52 @@ unsafe fn parse_forward(record: *const CbRecord, info: &mut CorebootInfo) {
     let mut offset = 0u32;
 
     while offset < table_bytes {
-        let record = table_start.add(offset as usize) as *const CbRecord;
-        let record_size = core::ptr::addr_of!((*record).size).read_unaligned();
+        let record_ptr = table_start.add(offset as usize);
+
+        // Read record header to get size
+        let record_header_bytes = core::slice::from_raw_parts(record_ptr, 8);
+        let Ok((record_header, _)) = CbRecord::read_from_prefix(record_header_bytes) else {
+            log::warn!("Failed to parse record header");
+            break;
+        };
+        let record_size = record_header.size;
 
         if record_size < 8 {
             log::warn!("Invalid record size: {}", record_size);
             break;
         }
 
-        parse_record(record, info);
+        // Create slice for the full record and call safe parse_record
+        let record_bytes = core::slice::from_raw_parts(record_ptr, record_size as usize);
+        parse_record(record_bytes, info);
 
         offset += record_size;
     }
 }
 
 /// Parse ACPI RSDP pointer
-unsafe fn parse_acpi_rsdp(record: *const CbRecord, info: &mut CorebootInfo) {
-    let rsdp = record as *const CbAcpiRsdp;
-    let rsdp_pointer = core::ptr::addr_of!((*rsdp).rsdp_pointer).read_unaligned();
+///
+/// This function is safe - it uses zerocopy to parse the ACPI RSDP struct.
+fn parse_acpi_rsdp(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((rsdp, _)) = CbAcpiRsdp::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse ACPI RSDP record");
+        return;
+    };
+    let rsdp_pointer = rsdp.rsdp_pointer;
     info.acpi_rsdp = Some(rsdp_pointer);
 
     log::debug!("ACPI RSDP: {:#x}", rsdp_pointer);
 }
 
 /// Parse CBMEM console reference
-unsafe fn parse_cbmem_console(record: *const CbRecord, info: &mut CorebootInfo) {
-    let cbmem_ref = record as *const CbCbmemRef;
-    let cbmem_addr = core::ptr::addr_of!((*cbmem_ref).cbmem_addr).read_unaligned();
+///
+/// This function is safe - it uses zerocopy to parse the CBMEM ref struct.
+fn parse_cbmem_console(record_bytes: &[u8], info: &mut CorebootInfo) {
+    let Ok((cbmem_ref, _)) = CbCbmemRef::read_from_prefix(record_bytes) else {
+        log::warn!("Failed to parse CBMEM console record");
+        return;
+    };
+    let cbmem_addr = cbmem_ref.cbmem_addr;
     info.cbmem_console = Some(cbmem_addr);
 
     log::debug!("CBMEM console: {:#x}", cbmem_addr);

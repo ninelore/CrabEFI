@@ -5,6 +5,7 @@
 
 use crate::arch::x86_64::io;
 use core::sync::atomic::{AtomicU64, Ordering};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 // Re-export rdtsc from arch module for public API
 pub use crate::arch::x86_64::rdtsc;
@@ -37,6 +38,7 @@ fn read_pm_timer() -> u32 {
 
 /// ACPI RSDP structure (Root System Description Pointer)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct AcpiRsdp {
     signature: [u8; 8], // "RSD PTR "
     checksum: u8,
@@ -52,6 +54,7 @@ struct AcpiRsdp {
 
 /// ACPI SDT header (common to all tables)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct AcpiSdtHeader {
     signature: [u8; 4],
     length: u32,
@@ -66,6 +69,7 @@ struct AcpiSdtHeader {
 
 /// ACPI FADT (Fixed ACPI Description Table)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct AcpiFadt {
     header: AcpiSdtHeader,
     firmware_ctrl: u32,
@@ -119,15 +123,12 @@ unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
     }
 
     // Get RSDT or XSDT address
-    let (table_addr, is_xsdt) =
-        if rsdp.revision >= 2 && core::ptr::addr_of!(rsdp.xsdt_address).read_unaligned() != 0 {
-            (
-                core::ptr::addr_of!(rsdp.xsdt_address).read_unaligned(),
-                true,
-            )
-        } else {
-            (rsdp.rsdt_address as u64, false)
-        };
+    // With zerocopy's Unaligned derive, we can safely access packed fields
+    let (table_addr, is_xsdt) = if rsdp.revision >= 2 && rsdp.xsdt_address != 0 {
+        (rsdp.xsdt_address, true)
+    } else {
+        (rsdp.rsdt_address as u64, false)
+    };
 
     if table_addr == 0 {
         log::warn!("No RSDT/XSDT address in RSDP");
@@ -135,7 +136,8 @@ unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
     }
 
     let header = &*(table_addr as *const AcpiSdtHeader);
-    let table_len = core::ptr::addr_of!(header.length).read_unaligned() as usize;
+    // With zerocopy's Unaligned derive, we can safely access packed fields
+    let table_len = header.length as usize;
     let header_size = core::mem::size_of::<AcpiSdtHeader>();
 
     // Calculate number of entries
@@ -165,8 +167,9 @@ unsafe fn find_pm_timer_port(rsdp_addr: u64) -> Option<(u16, bool)> {
         let entry_header = &*(entry_addr as *const AcpiSdtHeader);
         if &entry_header.signature == b"FACP" {
             let fadt = &*(entry_addr as *const AcpiFadt);
-            let pm_tmr_blk = core::ptr::addr_of!(fadt.pm_tmr_blk).read_unaligned();
-            let flags = core::ptr::addr_of!(fadt.flags).read_unaligned();
+            // With zerocopy's Unaligned derive, we can safely access packed fields
+            let pm_tmr_blk = fadt.pm_tmr_blk;
+            let flags = fadt.flags;
             let is_32bit = (flags & (1 << 8)) != 0; // TMR_VAL_EXT bit
 
             if pm_tmr_blk != 0 {

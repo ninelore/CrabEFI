@@ -4,6 +4,7 @@
 //! System Partition (ESP).
 
 use crate::drivers::block::{BlockDevice, BlockError};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// Maximum supported block size (4KB - handles most devices including CD-ROMs)
 const MAX_BLOCK_SIZE: usize = 4096;
@@ -26,7 +27,7 @@ const ESP_TYPE_GUID: [u8; 16] = [
 
 /// GPT Header structure
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct GptHeader {
     /// Signature ("EFI PART")
     pub signature: u64,
@@ -67,7 +68,7 @@ impl GptHeader {
 
 /// GPT Partition Entry
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct GptPartitionEntry {
     /// Partition type GUID
     pub type_guid: [u8; 16],
@@ -128,18 +129,15 @@ impl GptPartitionEntry {
     /// Get partition name as ASCII (for display)
     pub fn name_ascii(&self) -> heapless::String<72> {
         let mut s = heapless::String::new();
-        // Read name bytes avoiding alignment issues with packed struct
-        let ptr = self as *const Self as *const u8;
-        // Name field is at offset 56 (16+16+8+8+8)
-        let name_ptr = unsafe { ptr.add(56) as *const u16 };
-
-        (0..36)
-            .map(|i| unsafe { core::ptr::read_unaligned(name_ptr.add(i)) })
-            .take_while(|&c| c != 0)
-            .for_each(|c| {
-                // Convert UTF-16LE to ASCII (simple conversion)
-                let _ = s.push(if c < 128 { c as u8 as char } else { '?' });
-            });
+        // Copy name array to avoid reference to packed struct field
+        let name = self.name;
+        for c in name {
+            if c == 0 {
+                break;
+            }
+            // Convert UTF-16LE to ASCII (simple conversion)
+            let _ = s.push(if c < 128 { c as u8 as char } else { '?' });
+        }
         s
     }
 }
@@ -235,11 +233,12 @@ pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptE
 
     device.read_block(lba, &mut buffer[..block_size])?;
 
-    // Parse header from the appropriate offset
-    let header =
-        unsafe { core::ptr::read_unaligned(buffer[gpt_offset..].as_ptr() as *const GptHeader) };
+    // Parse header from the appropriate offset using zerocopy
+    let header = GptHeader::read_from_prefix(&buffer[gpt_offset..])
+        .map_err(|_| GptError::InvalidHeader)?
+        .0;
 
-    // Copy fields to avoid alignment issues with packed struct
+    // Copy fields for logging to avoid reference to packed struct
     let signature = header.signature;
     let revision = header.revision;
     let num_partition_entries = header.num_partition_entries;
@@ -319,8 +318,10 @@ pub fn read_partitions<D: BlockDevice>(
         // Process entries from this block
         let mut pos = offset_in_block;
         while pos + entry_size <= block_size && entry_index < header.num_partition_entries {
-            let entry = unsafe {
-                core::ptr::read_unaligned(buffer[pos..].as_ptr() as *const GptPartitionEntry)
+            // Parse partition entry using zerocopy
+            let entry = match GptPartitionEntry::read_from_prefix(&buffer[pos..]) {
+                Ok((e, _)) => e,
+                Err(_) => break, // Malformed entry, stop processing
             };
 
             if !entry.is_empty() {

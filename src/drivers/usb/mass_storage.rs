@@ -8,7 +8,7 @@
 
 use super::controller::{UsbController, UsbError};
 use crate::time;
-use core::ptr;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// SCSI Commands
 #[allow(dead_code)]
@@ -24,7 +24,7 @@ mod scsi_cmd {
 
 /// Command Block Wrapper (CBW) - 31 bytes
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct CommandBlockWrapper {
     /// Signature (0x43425355 = "USBC")
     pub signature: u32,
@@ -44,7 +44,7 @@ pub struct CommandBlockWrapper {
 
 /// Command Status Wrapper (CSW) - 13 bytes
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct CommandStatusWrapper {
     /// Signature (0x53425355 = "USBS")
     pub signature: u32,
@@ -70,7 +70,7 @@ mod csw_status {
 
 /// SCSI Inquiry Response
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct InquiryResponse {
     /// Peripheral device type (bits 0-4), qualifier (bits 5-7)
     pub peripheral: u8,
@@ -98,7 +98,7 @@ pub struct InquiryResponse {
 
 /// Read Capacity 10 Response
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default)]
 pub struct ReadCapacity10Response {
     /// Last Logical Block Address (big-endian)
     pub last_lba: u32,
@@ -276,7 +276,10 @@ impl UsbMassStorage {
         let mut csw_buf = [0u8; 13];
         controller.bulk_transfer(self.device_addr, self.bulk_in, true, &mut csw_buf)?;
 
-        let csw = unsafe { ptr::read_unaligned(csw_buf.as_ptr() as *const CommandStatusWrapper) };
+        // Parse CSW using zerocopy
+        let csw = CommandStatusWrapper::read_from_prefix(&csw_buf)
+            .map_err(|_| MassStorageError::InvalidCsw)?
+            .0;
 
         // Verify CSW
         if csw.signature != CSW_SIGNATURE {
@@ -312,10 +315,11 @@ impl UsbMassStorage {
 
         self.scsi_command(controller, &cdb, Some(&mut response), true)?;
 
-        let inquiry = unsafe { ptr::read_unaligned(response.as_ptr() as *const InquiryResponse) };
-
-        self.vendor = inquiry.vendor;
-        self.product = inquiry.product;
+        // Parse inquiry response using zerocopy
+        if let Ok((inquiry, _)) = InquiryResponse::read_from_prefix(&response) {
+            self.vendor = inquiry.vendor;
+            self.product = inquiry.product;
+        }
 
         Ok(())
     }
@@ -330,8 +334,10 @@ impl UsbMassStorage {
 
         self.scsi_command(controller, &cdb, Some(&mut response), true)?;
 
-        let cap =
-            unsafe { ptr::read_unaligned(response.as_ptr() as *const ReadCapacity10Response) };
+        // Parse capacity response using zerocopy
+        let cap = ReadCapacity10Response::read_from_prefix(&response)
+            .map_err(|_| MassStorageError::InvalidParameter)?
+            .0;
 
         // Values are big-endian
         let last_lba = u32::from_be(cap.last_lba);

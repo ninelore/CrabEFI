@@ -7,6 +7,7 @@ use core::ffi::c_void;
 use r_efi::efi::{self, Guid, Handle, TableHeader};
 use r_efi::protocols::simple_text_input::Protocol as SimpleTextInputProtocol;
 use r_efi::protocols::simple_text_output::Protocol as SimpleTextOutputProtocol;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 use crate::state::{self, ConfigurationTable, MAX_CONFIG_TABLES};
 
@@ -242,6 +243,7 @@ use super::utils::guid_eq;
 
 /// ACPI RSDP structure (Root System Description Pointer)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct AcpiRsdp {
     signature: [u8; 8], // "RSD PTR "
     checksum: u8,
@@ -257,6 +259,7 @@ struct AcpiRsdp {
 
 /// ACPI SDT header (common to all tables)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct AcpiSdtHeader {
     signature: [u8; 4],
     length: u32,
@@ -281,7 +284,7 @@ struct AcpiRegion {
 
 /// Collect all ACPI table regions, merge overlapping ones, then mark them
 fn mark_acpi_tables_memory(rsdp_addr: u64) {
-    use super::allocator::{PAGE_SIZE, mark_as_acpi_reclaim};
+    use super::allocator::{mark_as_acpi_reclaim, PAGE_SIZE};
 
     log::info!("Marking ACPI table memory regions as AcpiReclaimMemory...");
 
@@ -315,8 +318,9 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
     let revision = rsdp.revision;
 
     // Add RSDP
+    // With zerocopy's Unaligned derive, we can safely access packed fields
     let rsdp_size = if revision >= 2 {
-        unsafe { core::ptr::addr_of!(rsdp.length).read_unaligned() as u64 }
+        rsdp.length as u64
     } else {
         20 // ACPI 1.0 RSDP is 20 bytes
     };
@@ -329,13 +333,9 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
     add_region(rsdp_addr, rsdp_size);
 
     // Get RSDT or XSDT address
-    let (root_table_addr, is_xsdt) = if revision >= 2 {
-        let xsdt = unsafe { core::ptr::addr_of!(rsdp.xsdt_address).read_unaligned() };
-        if xsdt != 0 {
-            (xsdt, true)
-        } else {
-            (rsdp.rsdt_address as u64, false)
-        }
+    // With zerocopy's Unaligned derive, we can safely access packed fields
+    let (root_table_addr, is_xsdt) = if revision >= 2 && rsdp.xsdt_address != 0 {
+        (rsdp.xsdt_address, true)
     } else {
         (rsdp.rsdt_address as u64, false)
     };
@@ -347,7 +347,8 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
     // Add root table (RSDT or XSDT)
     let root_header = unsafe { &*(root_table_addr as *const AcpiSdtHeader) };
-    let root_length = unsafe { core::ptr::addr_of!(root_header.length).read_unaligned() };
+    // With zerocopy's Unaligned derive, we can safely access packed fields
+    let root_length = root_header.length;
     let root_sig = &root_header.signature;
     log::debug!(
         "{} at {:#x}, length {} bytes",
@@ -380,7 +381,8 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         }
 
         let table_header = unsafe { &*(table_addr as *const AcpiSdtHeader) };
-        let table_length = unsafe { core::ptr::addr_of!(table_header.length).read_unaligned() };
+        // With zerocopy's Unaligned derive, we can safely access packed fields
+        let table_length = table_header.length;
         let table_sig = &table_header.signature;
         let sig_str = core::str::from_utf8(table_sig).unwrap_or("????");
 
@@ -411,8 +413,8 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
             if dsdt_addr != 0 {
                 let dsdt_header = unsafe { &*(dsdt_addr as *const AcpiSdtHeader) };
-                let dsdt_length =
-                    unsafe { core::ptr::addr_of!(dsdt_header.length).read_unaligned() };
+                // With zerocopy's Unaligned derive, we can safely access packed fields
+                let dsdt_length = dsdt_header.length;
                 log::debug!("    DSDT at {:#x}, length {} bytes", dsdt_addr, dsdt_length);
                 add_region(dsdt_addr, dsdt_length as u64);
             }
@@ -502,7 +504,7 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
 
 /// Install ACPI tables from coreboot
 pub fn install_acpi_tables(rsdp: u64) {
-    use super::allocator::{MemoryType, get_memory_type_at};
+    use super::allocator::{get_memory_type_at, MemoryType};
 
     if rsdp == 0 {
         log::warn!("ACPI RSDP address is null, skipping ACPI table installation");

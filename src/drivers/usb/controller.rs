@@ -12,6 +12,7 @@
 
 use crate::efi;
 use core::ptr;
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 // ============================================================================
 // USB Speed
@@ -125,7 +126,7 @@ pub enum Direction {
 /// Used for control transfers to send commands to USB devices.
 /// All multi-byte fields are little-endian.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug)]
 pub struct SetupPacket {
     /// Request type (direction, type, recipient)
     pub request_type: u8,
@@ -180,7 +181,7 @@ pub mod desc_type {
 
 /// USB Device Descriptor (18 bytes)
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default, Debug)]
 pub struct DeviceDescriptor {
     /// Size of this descriptor (18)
     pub length: u8,
@@ -214,7 +215,7 @@ pub struct DeviceDescriptor {
 
 /// USB Configuration Descriptor (9 bytes)
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default, Debug)]
 pub struct ConfigurationDescriptor {
     /// Size of this descriptor (9)
     pub length: u8,
@@ -236,7 +237,7 @@ pub struct ConfigurationDescriptor {
 
 /// USB Interface Descriptor (9 bytes)
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default, Debug)]
 pub struct InterfaceDescriptor {
     /// Size of this descriptor (9)
     pub length: u8,
@@ -260,7 +261,7 @@ pub struct InterfaceDescriptor {
 
 /// USB Endpoint Descriptor (7 bytes)
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default, Debug)]
 pub struct EndpointDescriptor {
     /// Size of this descriptor (7)
     pub length: u8,
@@ -295,7 +296,7 @@ impl EndpointDescriptor {
 
 /// HID Descriptor
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Default, Debug)]
 pub struct HidDescriptor {
     /// Size of this descriptor
     pub length: u8,
@@ -372,7 +373,7 @@ pub mod hid_request {
 
 /// USB Hub descriptor (USB 2.0 Section 11.23.2.1)
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned, Clone, Copy, Debug, Default)]
 pub struct HubDescriptor {
     /// Descriptor length
     pub length: u8,
@@ -960,8 +961,11 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
         return info;
     }
 
-    let config =
-        unsafe { ptr::read_unaligned(config_data.as_ptr() as *const ConfigurationDescriptor) };
+    // Parse configuration descriptor using zerocopy
+    let config = match ConfigurationDescriptor::read_from_prefix(config_data) {
+        Ok((c, _)) => c,
+        Err(_) => return info,
+    };
     info.configuration_value = config.configuration_value;
 
     let mut current_interface: Option<InterfaceInfo> = None;
@@ -977,10 +981,8 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
                     info.num_interfaces += 1;
                 }
 
-                if desc_data.len() >= 9 {
-                    let iface = unsafe {
-                        ptr::read_unaligned(desc_data.as_ptr() as *const InterfaceDescriptor)
-                    };
+                // Parse interface descriptor using zerocopy
+                if let Ok((iface, _)) = InterfaceDescriptor::read_from_prefix(desc_data) {
                     current_interface = Some(InterfaceInfo {
                         interface_number: iface.interface_number,
                         alternate_setting: iface.alternate_setting,
@@ -994,14 +996,13 @@ pub fn parse_configuration(config_data: &[u8]) -> ConfigurationInfo {
             }
             desc_type::ENDPOINT => {
                 if let Some(ref mut iface) = current_interface
-                    && desc_data.len() >= 7
                     && iface.num_endpoints < 4
                 {
-                    let ep = unsafe {
-                        ptr::read_unaligned(desc_data.as_ptr() as *const EndpointDescriptor)
-                    };
-                    iface.endpoints[iface.num_endpoints] = EndpointInfo::from_descriptor(&ep);
-                    iface.num_endpoints += 1;
+                    // Parse endpoint descriptor using zerocopy
+                    if let Ok((ep, _)) = EndpointDescriptor::read_from_prefix(desc_data) {
+                        iface.endpoints[iface.num_endpoints] = EndpointInfo::from_descriptor(&ep);
+                        iface.num_endpoints += 1;
+                    }
                 }
             }
             _ => {}

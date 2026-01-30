@@ -12,6 +12,7 @@
 
 use crate::efi::allocator::{self, AllocateType, MemoryType, PAGE_SIZE};
 use r_efi::efi::{Handle, Status, SystemTable};
+use zerocopy::{FromBytes, Immutable, KnownLayout, Unaligned};
 
 /// DOS header magic "MZ"
 const DOS_MAGIC: u16 = 0x5A4D;
@@ -46,6 +47,7 @@ const MAX_DATA_DIRECTORIES: u32 = 16;
 
 /// DOS Header
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct DosHeader {
     e_magic: u16,
     e_cblp: u16,
@@ -70,6 +72,7 @@ struct DosHeader {
 
 /// COFF File Header
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct CoffHeader {
     machine: u16,
     number_of_sections: u16,
@@ -82,6 +85,7 @@ struct CoffHeader {
 
 /// Optional Header (PE32+)
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct OptionalHeader64 {
     magic: u16,
     major_linker_version: u8,
@@ -117,6 +121,7 @@ struct OptionalHeader64 {
 
 /// Data Directory entry
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct DataDirectory {
     virtual_address: u32,
     size: u32,
@@ -124,6 +129,7 @@ struct DataDirectory {
 
 /// Section Header
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct SectionHeader {
     name: [u8; 8],
     virtual_size: u32,
@@ -139,6 +145,7 @@ struct SectionHeader {
 
 /// Base Relocation Block
 #[repr(C, packed)]
+#[derive(FromBytes, Immutable, KnownLayout, Unaligned)]
 struct BaseRelocation {
     virtual_address: u32,
     size_of_block: u32,
@@ -160,15 +167,6 @@ pub struct LoadedImage {
     pub num_pages: u64,
 }
 
-/// Helper to safely read an unaligned value from a packed struct field
-///
-/// # Safety
-/// The pointer must be valid and point to initialized memory of type T
-#[inline]
-unsafe fn read_unaligned<T: Copy>(ptr: *const T) -> T {
-    ptr.read_unaligned()
-}
-
 /// Load a PE32+ image from memory
 ///
 /// # Arguments
@@ -181,22 +179,25 @@ unsafe fn read_unaligned<T: Copy>(ptr: *const T) -> T {
 /// # Security
 /// All header fields are validated before use to prevent out-of-bounds access.
 pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
-    // Validate minimum size for DOS header
-    if data.len() < core::mem::size_of::<DosHeader>() {
-        log::error!("PE: Data too small for DOS header");
-        return Err(Status::INVALID_PARAMETER);
-    }
+    // Parse DOS header using zerocopy
+    let dos_header = match DosHeader::ref_from_prefix(data) {
+        Ok((h, _)) => h,
+        Err(_) => {
+            log::error!("PE: Data too small for DOS header");
+            return Err(Status::INVALID_PARAMETER);
+        }
+    };
 
-    // Safety: We verified data.len() >= sizeof(DosHeader)
-    let dos_header = unsafe { &*(data.as_ptr() as *const DosHeader) };
+    // Copy fields to avoid reference to packed struct in log macro
+    let dos_magic = dos_header.e_magic;
+    let pe_offset_val = dos_header.e_lfanew;
 
-    let dos_magic = unsafe { read_unaligned(core::ptr::addr_of!(dos_header.e_magic)) };
     if dos_magic != DOS_MAGIC {
         log::error!("PE: Invalid DOS magic: {:#x}", dos_magic);
         return Err(Status::INVALID_PARAMETER);
     }
 
-    let pe_offset = unsafe { read_unaligned(core::ptr::addr_of!(dos_header.e_lfanew)) } as usize;
+    let pe_offset = pe_offset_val as usize;
 
     // Validate PE offset doesn't overflow and points within data
     let pe_sig_end = pe_offset.checked_add(4).ok_or_else(|| {
@@ -216,29 +217,28 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Validate COFF header fits
+    // Parse COFF header using zerocopy
     let coff_offset = pe_offset.checked_add(4).ok_or(Status::INVALID_PARAMETER)?;
+    let coff_header = match CoffHeader::ref_from_prefix(&data[coff_offset..]) {
+        Ok((h, _)) => h,
+        Err(_) => {
+            log::error!("PE: COFF header extends beyond data");
+            return Err(Status::INVALID_PARAMETER);
+        }
+    };
     let coff_end = coff_offset
         .checked_add(core::mem::size_of::<CoffHeader>())
         .ok_or(Status::INVALID_PARAMETER)?;
-    if coff_end > data.len() {
-        log::error!("PE: COFF header extends beyond data");
-        return Err(Status::INVALID_PARAMETER);
-    }
 
-    // Safety: We verified the COFF header fits within data
-    let coff_header = unsafe { &*(data.as_ptr().add(coff_offset) as *const CoffHeader) };
+    // Copy fields to avoid reference to packed struct in log macro
+    let machine = coff_header.machine;
+    let num_sections = coff_header.number_of_sections;
+    let opt_header_size = coff_header.size_of_optional_header;
 
-    let machine = unsafe { read_unaligned(core::ptr::addr_of!(coff_header.machine)) };
     if machine != IMAGE_FILE_MACHINE_AMD64 {
         log::error!("PE: Unsupported machine type: {:#x}", machine);
         return Err(Status::UNSUPPORTED);
     }
-
-    let num_sections =
-        unsafe { read_unaligned(core::ptr::addr_of!(coff_header.number_of_sections)) };
-    let opt_header_size =
-        unsafe { read_unaligned(core::ptr::addr_of!(coff_header.size_of_optional_header)) };
 
     // Validate section count is reasonable
     if num_sections > MAX_SECTIONS {
@@ -246,40 +246,37 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Validate optional header fits
-    let opt_offset = coff_end;
-    let opt_end = opt_offset
-        .checked_add(opt_header_size as usize)
-        .ok_or(Status::INVALID_PARAMETER)?;
-    if opt_end > data.len() {
-        log::error!("PE: Optional header extends beyond data");
-        return Err(Status::INVALID_PARAMETER);
-    }
-
     // Validate optional header is large enough for PE32+
+    let opt_offset = coff_end;
     if (opt_header_size as usize) < core::mem::size_of::<OptionalHeader64>() {
         log::error!("PE: Optional header too small for PE32+");
         return Err(Status::INVALID_PARAMETER);
     }
 
-    // Safety: We verified the optional header fits within data
-    let opt_header = unsafe { &*(data.as_ptr().add(opt_offset) as *const OptionalHeader64) };
+    // Parse optional header using zerocopy
+    let opt_header = match OptionalHeader64::ref_from_prefix(&data[opt_offset..]) {
+        Ok((h, _)) => h,
+        Err(_) => {
+            log::error!("PE: Optional header extends beyond data");
+            return Err(Status::INVALID_PARAMETER);
+        }
+    };
+    let _opt_end = opt_offset
+        .checked_add(opt_header_size as usize)
+        .ok_or(Status::INVALID_PARAMETER)?;
 
-    let magic = unsafe { read_unaligned(core::ptr::addr_of!(opt_header.magic)) };
+    // Copy fields to avoid reference to packed struct in log macro
+    let magic = opt_header.magic;
+    let image_size = opt_header.size_of_image;
+    let image_base_preferred = opt_header.image_base;
+    let entry_point_rva = opt_header.address_of_entry_point;
+    let size_of_headers = opt_header.size_of_headers;
+    let num_data_dirs = opt_header.number_of_rva_and_sizes;
+
     if magic != PE32_PLUS_MAGIC {
         log::error!("PE: Not a PE32+ image: {:#x}", magic);
         return Err(Status::UNSUPPORTED);
     }
-
-    let image_size = unsafe { read_unaligned(core::ptr::addr_of!(opt_header.size_of_image)) };
-    let image_base_preferred =
-        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.image_base)) };
-    let entry_point_rva =
-        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.address_of_entry_point)) };
-    let size_of_headers =
-        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.size_of_headers)) };
-    let num_data_dirs =
-        unsafe { read_unaligned(core::ptr::addr_of!(opt_header.number_of_rva_and_sizes)) };
 
     // Validate image size is reasonable
     if image_size == 0 || image_size > MAX_IMAGE_SIZE {
@@ -364,22 +361,21 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
         );
     }
 
-    // Safety: We verified section headers fit within data
-    let section_headers = unsafe {
-        core::slice::from_raw_parts(
-            data.as_ptr().add(sections_offset) as *const SectionHeader,
-            num_sections as usize,
-        )
-    };
+    // Parse section headers using zerocopy
+    // We iterate and parse each section header individually
+    let section_data = &data[sections_offset..sections_end];
 
     // Copy sections with full bounds validation
-    for (i, section) in section_headers.iter().enumerate() {
-        let virt_addr = unsafe { read_unaligned(core::ptr::addr_of!(section.virtual_address)) };
-        let virt_size = unsafe { read_unaligned(core::ptr::addr_of!(section.virtual_size)) };
-        let raw_data_ptr =
-            unsafe { read_unaligned(core::ptr::addr_of!(section.pointer_to_raw_data)) };
-        let raw_data_size =
-            unsafe { read_unaligned(core::ptr::addr_of!(section.size_of_raw_data)) };
+    for i in 0..num_sections as usize {
+        let section_offset = i * core::mem::size_of::<SectionHeader>();
+        let section = match SectionHeader::ref_from_prefix(&section_data[section_offset..]) {
+            Ok((s, _)) => s,
+            Err(_) => break,
+        };
+        let virt_addr = section.virtual_address;
+        let virt_size = section.virtual_size;
+        let raw_data_ptr = section.pointer_to_raw_data;
+        let raw_data_size = section.size_of_raw_data;
 
         if raw_data_size == 0 || raw_data_ptr == 0 {
             continue;
@@ -451,20 +447,21 @@ pub fn load_image(data: &[u8]) -> Result<LoadedImage, Status> {
             return Err(Status::INVALID_PARAMETER);
         }
 
-        // Safety: We verified data directories fit within data
-        let data_dirs = unsafe {
-            core::slice::from_raw_parts(
-                data.as_ptr().add(data_dirs_offset) as *const DataDirectory,
-                num_data_dirs as usize,
-            )
-        };
+        // Parse data directories using zerocopy
+        let data_dirs_data = &data[data_dirs_offset..data_dirs_end];
 
         // Apply relocations if the relocation directory exists
         if num_data_dirs as usize > IMAGE_DIRECTORY_ENTRY_BASERELOC {
-            let reloc_dir = &data_dirs[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-            let reloc_rva =
-                unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.virtual_address)) };
-            let reloc_size = unsafe { read_unaligned(core::ptr::addr_of!(reloc_dir.size)) };
+            let reloc_dir_offset = IMAGE_DIRECTORY_ENTRY_BASERELOC * core::mem::size_of::<DataDirectory>();
+            let reloc_dir = match DataDirectory::ref_from_prefix(&data_dirs_data[reloc_dir_offset..]) {
+                Ok((d, _)) => d,
+                Err(_) => {
+                    let _ = allocator::free_pages(load_addr, num_pages);
+                    return Err(Status::INVALID_PARAMETER);
+                }
+            };
+            let reloc_rva = reloc_dir.virtual_address;
+            let reloc_size = reloc_dir.size;
 
             if reloc_rva > 0
                 && reloc_size > 0
@@ -525,7 +522,13 @@ fn apply_relocations(
     }
 
     let mut offset = 0u32;
-    let reloc_data = (image_base + reloc_rva as u64) as *const u8;
+    // Create a slice from the relocation data in the loaded image
+    let reloc_slice = unsafe {
+        core::slice::from_raw_parts(
+            (image_base + reloc_rva as u64) as *const u8,
+            reloc_size as usize,
+        )
+    };
 
     while offset < reloc_size {
         // Validate we can read the block header
@@ -535,10 +538,16 @@ fn apply_relocations(
             break;
         }
 
-        // Safety: We verified there's room for the header
-        let block = unsafe { &*(reloc_data.add(offset as usize) as *const BaseRelocation) };
-        let block_rva = unsafe { read_unaligned(core::ptr::addr_of!(block.virtual_address)) };
-        let block_size = unsafe { read_unaligned(core::ptr::addr_of!(block.size_of_block)) };
+        // Parse relocation block using zerocopy
+        let block = match BaseRelocation::ref_from_prefix(&reloc_slice[offset as usize..]) {
+            Ok((b, _)) => b,
+            Err(_) => {
+                log::warn!("PE: Failed to parse relocation block");
+                break;
+            }
+        };
+        let block_rva = block.virtual_address;
+        let block_size = block.size_of_block;
 
         if block_size == 0 {
             break;
@@ -562,9 +571,10 @@ fn apply_relocations(
         let num_entries = (block_size as usize - BASE_RELOCATION_HEADER_SIZE) / 2;
 
         // Safety: We verified the block fits within the relocation directory
+        let entries_start = offset as usize + BASE_RELOCATION_HEADER_SIZE;
         let entries = unsafe {
             core::slice::from_raw_parts(
-                reloc_data.add(offset as usize + BASE_RELOCATION_HEADER_SIZE) as *const u16,
+                reloc_slice[entries_start..].as_ptr() as *const u16,
                 num_entries,
             )
         };
