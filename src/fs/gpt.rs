@@ -205,7 +205,7 @@ impl From<BlockError> for GptError {
 ///
 /// Handles both standard disks (512-byte sectors) and hybrid ISOs on CD-ROMs
 /// (2048-byte sectors with GPT embedded at byte offset 512).
-pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptError> {
+pub fn read_gpt_header(device: &mut dyn BlockDevice) -> Result<GptHeader, GptError> {
     // Use device's actual block size, capped at MAX_BLOCK_SIZE
     let info = device.info();
     let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);
@@ -263,8 +263,8 @@ pub fn read_gpt_header<D: BlockDevice>(device: &mut D) -> Result<GptHeader, GptE
 ///
 /// Handles both standard disks (512-byte sectors) and hybrid ISOs on CD-ROMs
 /// (2048-byte sectors with GPT written assuming 512-byte blocks).
-pub fn read_partitions<D: BlockDevice>(
-    device: &mut D,
+pub fn read_partitions(
+    device: &mut dyn BlockDevice,
     header: &GptHeader,
 ) -> Result<heapless::Vec<Partition, 16>, GptError> {
     let mut partitions = heapless::Vec::new();
@@ -394,7 +394,7 @@ pub fn read_partitions<D: BlockDevice>(
 }
 
 /// Find the EFI System Partition
-pub fn find_esp<D: BlockDevice>(device: &mut D) -> Result<Partition, GptError> {
+pub fn find_esp(device: &mut dyn BlockDevice) -> Result<Partition, GptError> {
     let header = read_gpt_header(device)?;
     let partitions = read_partitions(device, &header)?;
 

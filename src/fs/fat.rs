@@ -230,9 +230,9 @@ pub enum FatError {
 }
 
 /// FAT filesystem instance
-pub struct FatFilesystem<'a, D: BlockDevice> {
+pub struct FatFilesystem<'a> {
     /// Block device
-    device: &'a mut D,
+    device: &'a mut dyn BlockDevice,
     /// First sector of partition
     partition_start: u64,
     /// FAT type
@@ -261,9 +261,9 @@ pub struct FatFilesystem<'a, D: BlockDevice> {
     data_clusters: u32,
 }
 
-impl<'a, D: BlockDevice> FatFilesystem<'a, D> {
+impl<'a> FatFilesystem<'a> {
     /// Create a new FAT filesystem instance
-    pub fn new(device: &'a mut D, partition_start: u64) -> Result<Self, FatError> {
+    pub fn new(device: &'a mut dyn BlockDevice, partition_start: u64) -> Result<Self, FatError> {
         // Use device's actual block size for reading
         let info = device.info();
         let block_size = (info.block_size as usize).min(MAX_BLOCK_SIZE);

@@ -1583,8 +1583,8 @@ fn try_boot_from_esp_ahci(
 }
 
 /// Load and execute an EFI bootloader from the filesystem
-fn load_and_execute_bootloader<R: BlockDevice>(
-    fat: &mut fs::fat::FatFilesystem<R>,
+fn load_and_execute_bootloader(
+    fat: &mut fs::fat::FatFilesystem<'_>,
     path: &str,
     file_size: u32,
     device_handle: r_efi::efi::Handle,
