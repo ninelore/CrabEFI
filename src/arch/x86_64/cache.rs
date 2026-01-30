@@ -23,6 +23,9 @@ pub fn flush_cache_range(addr: u64, size: usize) {
     let start = addr as usize & !(CACHE_LINE_SIZE - 1);
     let end = (addr as usize + size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1);
 
+    // Memory fence before loop for proper CLFLUSH ordering on older AMD processors
+    fence(Ordering::SeqCst);
+
     for line in (start..end).step_by(CACHE_LINE_SIZE) {
         unsafe {
             core::arch::asm!(
