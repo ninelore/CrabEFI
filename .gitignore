@@ -4,6 +4,7 @@
 
 # Test artifacts
 test-disk.img
+test-security-disk.img
 test/*.efi
 
 # IDE/Editor
