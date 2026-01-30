@@ -57,16 +57,11 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Sort partition candidates by size (smallest first)
 ///
-/// Uses bubble sort since heapless::Vec doesn't have sort methods.
 /// Smaller partitions are tried first as they're more likely to be EFI boot partitions.
 fn sort_partitions_by_size(partitions: &mut heapless::Vec<(u32, fs::gpt::Partition), 8>) {
-    for i in 0..partitions.len() {
-        for j in (i + 1)..partitions.len() {
-            if partitions[j].1.size_bytes() < partitions[i].1.size_bytes() {
-                partitions.swap(i, j);
-            }
-        }
-    }
+    partitions
+        .as_mut_slice()
+        .sort_unstable_by_key(|(_, partition): &(u32, fs::gpt::Partition)| partition.size_bytes());
 }
 
 /// Initialize the CrabEFI firmware

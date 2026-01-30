@@ -670,10 +670,9 @@ extern "efiapi" fn locate_handle(
         return Status::BUFFER_TOO_SMALL;
     }
 
-    // Copy handles to buffer
-    for (i, h) in matching.iter().enumerate() {
-        unsafe { *buffer.add(i) = *h };
-    }
+    // Copy handles to buffer using slice copy
+    let dest = unsafe { core::slice::from_raw_parts_mut(buffer, matching.len()) };
+    dest.copy_from_slice(&matching[..]);
     unsafe { *buffer_size = required_size };
 
     if matching.is_empty() {
@@ -704,59 +703,60 @@ extern "efiapi" fn locate_device_path(
         return Status::INVALID_PARAMETER;
     }
 
-    // Find all handles with the specified protocol
+    // Find a handle with both the specified protocol and a DEVICE_PATH protocol
     let efi_state = state::efi();
 
-    for i in 0..efi_state.handle_count {
-        let mut has_protocol = false;
-        let mut handle_dp: *mut DevicePathProtocol = core::ptr::null_mut();
+    let found = efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .filter_map(|entry| {
+            let protocols = &entry.protocols[..entry.protocol_count];
 
-        for j in 0..efi_state.handles[i].protocol_count {
-            if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                has_protocol = true;
+            let has_protocol = protocols.iter().any(|p| guid_eq(&p.guid, &guid));
+
+            let handle_dp = protocols
+                .iter()
+                .find(|p| guid_eq(&p.guid, &r_efi::protocols::device_path::PROTOCOL_GUID))
+                .map(|p| p.interface as *mut DevicePathProtocol);
+
+            match (has_protocol, handle_dp) {
+                (true, Some(dp)) if !dp.is_null() => Some((entry.handle, dp)),
+                _ => None,
             }
-            // Also look for DEVICE_PATH protocol to get the device path
-            if guid_eq(
-                &efi_state.handles[i].protocols[j].guid,
-                &r_efi::protocols::device_path::PROTOCOL_GUID,
-            ) {
-                handle_dp = efi_state.handles[i].protocols[j].interface as *mut DevicePathProtocol;
-            }
-        }
+        })
+        .next();
 
-        if has_protocol && !handle_dp.is_null() {
-            // For the initrd case, GRUB installs a handle with LOAD_FILE2 and a vendor media
-            // device path. The kernel passes in that same device path to find it.
+    if let Some((handle, handle_dp)) = found {
+        // For the initrd case, GRUB installs a handle with LOAD_FILE2 and a vendor media
+        // device path. The kernel passes in that same device path to find it.
 
-            log::debug!(
-                "  -> SUCCESS (handle={:?}, device_path={:?})",
-                efi_state.handles[i].handle,
-                handle_dp
-            );
-            unsafe {
-                *device = efi_state.handles[i].handle;
-                // Update device_path to point to the End node of the handle's device path.
-                // The LoadFile2 protocol expects the remaining path after the match.
-                // Walk to the end of the device path and point to the End node.
-                let mut dp = handle_dp;
-                loop {
-                    let dp_type = (*dp).r#type;
-                    let dp_subtype = (*dp).sub_type;
-                    // End of device path: type 0x7F, subtype 0xFF
-                    if dp_type == 0x7f && dp_subtype == 0xff {
-                        break;
-                    }
-                    // Get length and move to next node
-                    let len = u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize;
-                    if len < 4 {
-                        break; // Invalid length, stop
-                    }
-                    dp = (dp as *const u8).add(len) as *mut DevicePathProtocol;
+        log::debug!(
+            "  -> SUCCESS (handle={:?}, device_path={:?})",
+            handle,
+            handle_dp
+        );
+        unsafe {
+            *device = handle;
+            // Update device_path to point to the End node of the handle's device path.
+            // The LoadFile2 protocol expects the remaining path after the match.
+            // Walk to the end of the device path and point to the End node.
+            let mut dp = handle_dp;
+            loop {
+                let dp_type = (*dp).r#type;
+                let dp_subtype = (*dp).sub_type;
+                // End of device path: type 0x7F, subtype 0xFF
+                if dp_type == 0x7f && dp_subtype == 0xff {
+                    break;
                 }
-                *device_path = dp;
+                // Get length and move to next node
+                let len = u16::from_le_bytes([(*dp).length[0], (*dp).length[1]]) as usize;
+                if len < 4 {
+                    break; // Invalid length, stop
+                }
+                dp = (dp as *const u8).add(len) as *mut DevicePathProtocol;
             }
-            return Status::SUCCESS;
+            *device_path = dp;
         }
+        return Status::SUCCESS;
     }
 
     log::debug!("  -> NOT_FOUND");
@@ -1181,41 +1181,49 @@ extern "efiapi" fn open_protocol(
 
     let efi_state = state::efi();
 
-    for i in 0..efi_state.handle_count {
-        if efi_state.handles[i].handle == handle {
-            for j in 0..efi_state.handles[i].protocol_count {
-                if guid_eq(&efi_state.handles[i].protocols[j].guid, &guid) {
-                    let iface = efi_state.handles[i].protocols[j].interface;
-                    if !interface.is_null() {
-                        unsafe { *interface = iface };
-                    }
-                    log::trace!("  -> SUCCESS (interface={:?})", iface);
+    // Find the handle entry
+    let handle_entry = efi_state.handles[..efi_state.handle_count]
+        .iter()
+        .find(|entry| entry.handle == handle);
 
-                    // For LOADED_IMAGE, log important fields
-                    if guid_name == "LOADED_IMAGE" && !iface.is_null() {
-                        let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
-                        let dev_handle = unsafe { (*lip).device_handle };
-                        let sys_table = unsafe { (*lip).system_table };
-                        log::trace!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
-                        log::trace!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
-                        // Check if SystemTable looks valid
-                        if !sys_table.is_null() {
-                            let bs = unsafe { (*sys_table).boot_services };
-                            log::trace!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
-                        } else {
-                            log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
-                        }
-                    }
-                    return Status::SUCCESS;
-                }
-            }
-            log::warn!("  -> UNSUPPORTED (protocol not on handle)");
-            return Status::UNSUPPORTED; // Handle exists but protocol not found
+    let Some(entry) = handle_entry else {
+        log::warn!("  -> INVALID_PARAMETER (handle not found)");
+        return Status::INVALID_PARAMETER;
+    };
+
+    // Find the protocol on this handle
+    let proto = entry.protocols[..entry.protocol_count]
+        .iter()
+        .find(|p| guid_eq(&p.guid, &guid));
+
+    let Some(proto) = proto else {
+        log::warn!("  -> UNSUPPORTED (protocol not on handle)");
+        return Status::UNSUPPORTED;
+    };
+
+    let iface = proto.interface;
+    if !interface.is_null() {
+        unsafe { *interface = iface };
+    }
+    log::trace!("  -> SUCCESS (interface={:?})", iface);
+
+    // For LOADED_IMAGE, log important fields
+    if guid_name == "LOADED_IMAGE" && !iface.is_null() {
+        let lip = iface as *const r_efi::protocols::loaded_image::Protocol;
+        let dev_handle = unsafe { (*lip).device_handle };
+        let sys_table = unsafe { (*lip).system_table };
+        log::trace!("  -> LOADED_IMAGE.DeviceHandle = {:?}", dev_handle);
+        log::trace!("  -> LOADED_IMAGE.SystemTable = {:?}", sys_table);
+        // Check if SystemTable looks valid
+        if !sys_table.is_null() {
+            let bs = unsafe { (*sys_table).boot_services };
+            log::trace!("  -> LOADED_IMAGE.SystemTable->BootServices = {:?}", bs);
+        } else {
+            log::error!("  -> LOADED_IMAGE.SystemTable is NULL!");
         }
     }
 
-    log::warn!("  -> INVALID_PARAMETER (handle not found)");
-    Status::INVALID_PARAMETER // Handle not found
+    Status::SUCCESS
 }
 
 extern "efiapi" fn close_protocol(

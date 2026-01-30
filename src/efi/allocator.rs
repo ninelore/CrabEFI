@@ -764,14 +764,9 @@ impl MemoryAllocator {
 
     /// Sort entries by physical address (ascending)
     fn sort_entries(&mut self) {
-        // Simple insertion sort (entries are mostly sorted already)
-        for i in 1..self.entries.len() {
-            let mut j = i;
-            while j > 0 && self.entries[j - 1].physical_start > self.entries[j].physical_start {
-                self.entries.swap(j - 1, j);
-                j -= 1;
-            }
-        }
+        self.entries
+            .as_mut_slice()
+            .sort_unstable_by_key(|entry| entry.physical_start);
     }
 
     /// Merge adjacent entries of the same type and attributes

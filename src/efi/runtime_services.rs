@@ -150,14 +150,13 @@ extern "efiapi" fn get_variable(
     let efi = state::efi();
     let variables = &efi.variables;
 
-    // Find the variable
-    for var in variables.iter() {
-        if !var.in_use {
-            continue;
-        }
+    // Find the variable using iterator
+    let found = variables
+        .iter()
+        .find(|var| var.in_use && guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name));
 
-        if guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name) {
-            // Found it
+    match found {
+        Some(var) => {
             let required_size = var.data_size;
 
             if data.is_null() || unsafe { *data_size } < required_size {
@@ -174,11 +173,10 @@ extern "efiapi" fn get_variable(
                 }
             }
 
-            return Status::SUCCESS;
+            Status::SUCCESS
         }
+        None => Status::NOT_FOUND,
     }
-
-    Status::NOT_FOUND
 }
 
 extern "efiapi" fn get_next_variable_name(
@@ -198,14 +196,23 @@ extern "efiapi" fn get_next_variable_name(
     // If name is empty, return first variable
     let is_first = unsafe { *current_name == 0 };
 
-    let mut found_current = is_first;
-    for var in variables.iter() {
-        if !var.in_use {
-            continue;
-        }
+    // Create iterator over in-use variables
+    let mut var_iter = variables.iter().filter(|var| var.in_use);
 
-        if found_current {
-            // Return this variable
+    // If not first call, skip to current variable and advance past it
+    let next_var = if is_first {
+        var_iter.next()
+    } else {
+        // Skip until we find the current variable, then get the next one
+        var_iter
+            .skip_while(|var| {
+                !(guid_eq(&var.vendor_guid, &current_guid) && name_eq(&var.name, current_name))
+            })
+            .nth(1) // Skip the current one and get the next
+    };
+
+    match next_var {
+        Some(var) => {
             let name_len = ucs2_strlen(&var.name) + 1; // Include null terminator
             let required_size = name_len * 2;
 
@@ -221,16 +228,10 @@ extern "efiapi" fn get_next_variable_name(
                 *variable_name_size = required_size;
             }
 
-            return Status::SUCCESS;
+            Status::SUCCESS
         }
-
-        // Check if this is the current variable
-        if guid_eq(&var.vendor_guid, &current_guid) && name_eq(&var.name, current_name) {
-            found_current = true;
-        }
+        None => Status::NOT_FOUND,
     }
-
-    Status::NOT_FOUND
 }
 
 extern "efiapi" fn set_variable(
@@ -265,20 +266,13 @@ extern "efiapi" fn set_variable(
     state::with_efi_mut(|efi| {
         let variables = &mut efi.variables;
 
-        // Find existing variable or free slot
-        let mut existing_idx: Option<usize> = None;
-        let mut free_idx: Option<usize> = None;
+        // Find existing variable using position()
+        let existing_idx = variables.iter().position(|var| {
+            var.in_use && guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name)
+        });
 
-        for (i, var) in variables.iter().enumerate() {
-            if var.in_use {
-                if guid_eq(&var.vendor_guid, &guid) && name_eq(&var.name, name) {
-                    existing_idx = Some(i);
-                    break;
-                }
-            } else if free_idx.is_none() {
-                free_idx = Some(i);
-            }
-        }
+        // Find first free slot using position()
+        let free_idx = variables.iter().position(|var| !var.in_use);
 
         // Delete variable if data_size is 0
         if data_size == 0 {
@@ -298,13 +292,10 @@ extern "efiapi" fn set_variable(
             },
         };
 
-        // Copy name
-        for i in 0..=name_len {
-            variables[idx].name[i] = unsafe { *name.add(i) };
-        }
-        for i in (name_len + 1)..MAX_VARIABLE_NAME_LEN {
-            variables[idx].name[i] = 0;
-        }
+        // Copy name using slice operations
+        let src = unsafe { core::slice::from_raw_parts(name, name_len + 1) };
+        variables[idx].name[..name_len + 1].copy_from_slice(src);
+        variables[idx].name[name_len + 1..].fill(0);
 
         // Copy data
         unsafe {
@@ -343,13 +334,12 @@ extern "efiapi" fn query_variable_info(
     let efi = state::efi();
     let variables = &efi.variables;
     let total_size = MAX_VARIABLES * MAX_VARIABLE_DATA_SIZE;
-    let mut used_size = 0usize;
 
-    for var in variables.iter() {
-        if var.in_use {
-            used_size += var.data_size;
-        }
-    }
+    let used_size: usize = variables
+        .iter()
+        .filter(|var| var.in_use)
+        .map(|var| var.data_size)
+        .sum();
 
     unsafe {
         *maximum_variable_storage_size = total_size as u64;

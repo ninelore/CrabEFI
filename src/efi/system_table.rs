@@ -193,21 +193,20 @@ pub fn install_configuration_table(guid: &Guid, table: *mut c_void) -> efi::Stat
         let count = &mut efi.config_table_count;
 
         // First, check if this GUID already exists
-        for i in 0..*count {
-            if guid_eq(&tables[i].vendor_guid, guid) {
-                if table.is_null() {
-                    // Remove the entry by shifting others down
-                    for j in i..*count - 1 {
-                        tables[j] = tables[j + 1];
-                    }
-                    *count -= 1;
-                    update_table_count(*count);
-                    return efi::Status::SUCCESS;
-                } else {
-                    // Update existing entry
-                    tables[i].vendor_table = table;
-                    return efi::Status::SUCCESS;
-                }
+        if let Some(i) = tables[..*count]
+            .iter()
+            .position(|t| guid_eq(&t.vendor_guid, guid))
+        {
+            if table.is_null() {
+                // Remove the entry by shifting others down
+                tables.copy_within(i + 1..*count, i);
+                *count -= 1;
+                update_table_count(*count);
+                return efi::Status::SUCCESS;
+            } else {
+                // Update existing entry
+                tables[i].vendor_table = table;
+                return efi::Status::SUCCESS;
             }
         }
 
@@ -439,14 +438,8 @@ fn mark_acpi_tables_memory(rsdp_addr: u64) {
         }
     }
 
-    // Sort regions by start address (simple bubble sort)
-    for i in 0..region_count {
-        for j in (i + 1)..region_count {
-            if regions[j].start < regions[i].start {
-                regions.swap(i, j);
-            }
-        }
-    }
+    // Sort regions by start address
+    regions[..region_count].sort_unstable_by_key(|r| r.start);
 
     // Merge overlapping/adjacent regions
     let mut merged: [AcpiRegion; MAX_ACPI_REGIONS] =
