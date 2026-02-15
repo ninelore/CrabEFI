@@ -3,22 +3,30 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      flake-utils,
+      rust-overlay,
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-      in
-      {
-        devShells.default = pkgs.mkShell {
+    let
+      overlays = [ (import rust-overlay) ];
+      forAllSystems =
+        function:
+        nixpkgs.lib.genAttrs [
+          "x86_64-linux"
+          "aarch64-linux"
+        ] (system: function (import nixpkgs { inherit system overlays; }));
+    in
+    {
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
           buildInputs = with pkgs; [
             # QEMU for testing
             qemu
@@ -33,19 +41,11 @@
 
             # Compression for firmware
             zstd
-          ];
 
-          # Rust is managed by rustup via rust-toolchain.toml files
-          # Install rustup separately: https://rustup.rs/
-          shellHook = ''
-            echo "CrabEFI development environment"
-            echo ""
-            echo "Rust is managed by rustup via rust-toolchain.toml files."
-            echo "If you don't have rustup, install it from https://rustup.rs/"
-            echo ""
-            echo "Run './crabefi --help' for build commands"
-          '';
+            # Rust
+            (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+          ];
         };
-      }
-    );
+      });
+    };
 }
